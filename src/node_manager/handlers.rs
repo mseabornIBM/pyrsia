@@ -31,9 +31,24 @@ use std::io::{BufReader, Read};
 use std::panic::UnwindSafe;
 use std::str;
 use std::{fs, panic};
+use sysinfo::{System, SystemExt, ProcessExt, NetworkExt};
 
 //TODO: read from CLI config file
 pub const ALLOCATED_SPACE_FOR_ARTIFACTS: &str = "10.84 GB";
+const CPU_STRESS_CODE: i64 = 10; 
+const CPU_STRESS_WEIGHT: f64 = 2_f64;
+const NETWORK_STRESS_CODE: i64 = 20;
+const NETWORK_STRESS_WEIGHT: f64 = 0.001_f64;
+const DISK_STRESS_CODE: i64 = 30;
+const DISK_STRESS_WEIGHT: f64 = 0.001_f64;
+
+//This structure is used as the entries to the quality metrics vector
+#[derive(Debug, Clone, Copy)]
+struct MetricElement {
+    code: i64,
+    value: f64,
+    weight: f64
+}
 
 lazy_static! {
     pub static ref LOCAL_KEY: identity::Keypair = identity::Keypair::generate_ed25519();
@@ -145,6 +160,96 @@ pub fn disk_usage(repository_path: &str) -> Result<f64, anyhow::Error> {
     Ok(disk_usage)
 }
 
+/***************************************************
+ * Peer Quality Metrics
+ ***************************************************/
+// Get the local stress metric to advertise to peers
+fn get_quality_metric() -> f64 {
+    let qm_matrix = Vec::<MetricElement>::new();
+    let sys = System::new_all();
+
+    let (sys, qm_matrix) = get_cpu_stress(sys, qm_matrix);
+    let (sys, qm_matrix)  = get_network_stress(sys, qm_matrix);
+    let (_sys, qm_matrix)  = get_disk_stress(sys, qm_matrix);
+
+    let mut qm = 0_f64;
+    for metric in qm_matrix {
+        qm = qm + (metric.value * metric.weight);
+    }
+    qm
+}
+
+// This function gets the current CPU load on the system.
+fn get_cpu_stress(sys: System, mut quality_matrix: Vec::<MetricElement>) -> (System, Vec<MetricElement>) {
+    let loadav =  sys.load_average();
+
+    let cpu_stress = loadav.one; //using the average over the last 1 minute
+    let metric_entry = MetricElement {
+            code: CPU_STRESS_CODE,
+            value: cpu_stress,
+            weight: CPU_STRESS_WEIGHT
+    };
+    quality_matrix.push(metric_entry);
+    (sys, quality_matrix)
+}
+
+//This function gets the current network load on the system
+fn get_network_stress(mut sys: System, mut quality_matrix: Vec::<MetricElement>) -> (System, Vec<MetricElement>) {
+
+    sys.refresh_networks_list();
+    let networks = sys.networks();
+
+    let mut packets_in = 0;
+    let mut packets_out = 0;
+    for (_interface_name, network) in networks {
+        packets_in = packets_in + network.received();
+        packets_out = packets_out + network.transmitted();
+    }
+
+    //TODO: add network card capabilities to the metric. cards with > network capacity should get a lower stress number.
+
+    let metric_entry = MetricElement{
+        code: NETWORK_STRESS_CODE,
+        value: (packets_in as f64) + (packets_out as f64),
+        weight: NETWORK_STRESS_WEIGHT
+    };
+
+    quality_matrix.push(metric_entry);
+    (sys, quality_matrix)
+}
+
+fn get_disk_stress(mut sys: System, mut quality_matrix: Vec::<MetricElement>) -> (System, Vec<MetricElement>) {
+
+    sys.refresh_all();
+
+    // Sum up the disk usage measured as read and writes per process:
+    let mut total_usage = 0_u64;
+    for (_pid, process) in sys.processes() {
+        let usage = process.disk_usage();
+        total_usage = total_usage + usage.written_bytes + usage.read_bytes;
+    }
+
+    let metric_entry = MetricElement{
+        code: DISK_STRESS_CODE,
+        value: total_usage as f64,
+        weight: DISK_STRESS_WEIGHT
+    };
+
+    quality_matrix.push(metric_entry);
+    (sys, quality_matrix)
+}
+
+//convert a quality code to a string
+fn code_to_string(code: i64) -> String {
+    let string_code = match code {
+        CPU_STRESS_CODE => {String::from("CPU_STRESS_CODE")},
+        NETWORK_STRESS_CODE => {String::from("NETWORK_STRESS_CODE")},
+        DISK_STRESS_CODE => {String::from("DISK_STRESS_CODE")},
+        _ => {String::from("UNKNOWN CODE")}
+    };
+    string_code
+}
+
 #[cfg(test)]
 
 mod tests {
@@ -166,6 +271,8 @@ mod tests {
         0x25, 0x7, 0xbe, 0x2, 0x46, 0xea, 0x35, 0xe0, 0x9, 0x8c, 0xf6, 0x5, 0x4d, 0x36, 0x44, 0xc1,
         0x4f,
     ];
+    const CPU_THREADS: usize = 200;
+
     fn tear_down() {
         if Path::new(&env::var("PYRSIA_ARTIFACT_PATH").unwrap()).exists() {
             fs::remove_dir_all(env::var("PYRSIA_ARTIFACT_PATH").unwrap()).expect(&format!(
@@ -278,5 +385,57 @@ mod tests {
 
         assert_eq!(push_result, true);
         Ok(())
+    }
+
+    #[test]
+    fn cpu_load_test(){
+        use sysinfo::{System, SystemExt};
+        use std::thread;
+        use std::time::Duration;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let qm_matrix = Vec::<MetricElement>::new();
+        let mut sys = System::new_all();
+        sys.refresh_all();
+        let loading = Arc::new(AtomicBool::new(true));
+
+        let (_sys, qm_matrix) = get_cpu_stress(sys, qm_matrix);
+        let mut qm = 0_f64;
+        for metric in qm_matrix {
+            qm = qm + (metric.value*metric.weight);
+        }
+        assert_ne!(0_f64,qm); //zero should never be returned here
+
+        let mut threads = vec![];
+        for _i in 0..CPU_THREADS {
+            threads.push(thread::spawn({
+                let mut cpu_fire = 0;
+                let loading_test = loading.clone();
+                move || {
+                    while loading_test.load(Ordering::Relaxed) {
+                        cpu_fire = cpu_fire + 1;
+                    }
+                }
+            }));
+        }
+
+        thread::sleep(Duration::from_millis(2200)); //let cpu spin up
+        let qm2_matrix = Vec::<MetricElement>::new();
+        let mut sys2 = System::new_all();
+        sys2.refresh_all();
+        let (_sys2, qm2_matrix) = get_cpu_stress(sys2, qm2_matrix);
+        let mut qm2 = 0_f64;
+        for metric in qm2_matrix {
+            qm2 = qm2 + (metric.value*metric.weight);
+        }
+
+        assert!(qm2 >= qm);
+        loading.store(false, Ordering::Relaxed);  //kill thread
+
+        //wait for thread
+        for thread in threads{
+            thread.join().unwrap();
+        }                   
     }
 }
