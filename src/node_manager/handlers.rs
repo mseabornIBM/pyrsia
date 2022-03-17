@@ -437,4 +437,10 @@ mod tests {
             thread.join().unwrap();
         }                   
     }
+
+    #[test]
+    fn quality_metric_test(){
+        quality_metric = get_quality_metric();
+        assert!(quality_metric != 0);
+    }
 }
