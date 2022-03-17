@@ -282,7 +282,6 @@ mod tests {
         }
     }
 
-    #[test]
     #[assay(
         env = [
           ("PYRSIA_ARTIFACT_PATH", "pyrsia-test-node"),
