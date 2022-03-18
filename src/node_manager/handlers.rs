@@ -222,11 +222,11 @@ fn get_disk_stress(mut sys: System, mut quality_matrix: Vec::<MetricElement>) ->
 
     sys.refresh_all();
 
-    // Sum up the disk usage measured as read and writes per process:
+    // Sum up the disk usage measured as total read and writes per process:
     let mut total_usage = 0_u64;
     for (_pid, process) in sys.processes() {
         let usage = process.disk_usage();
-        total_usage = total_usage + usage.written_bytes + usage.read_bytes;
+        total_usage = total_usage + usage.total_written_bytes + usage.total_read_bytes;
     }
 
     let metric_entry = MetricElement{
@@ -385,12 +385,11 @@ mod tests {
         use std::sync::Arc;
 
         let qm_matrix = Vec::<MetricElement>::new();
-        let mut sys = System::new_all();
-        sys.refresh_all();
+        let sys = System::new_all();
         let loading = Arc::new(AtomicBool::new(true));
 
         //first measure of CPU for benchmark
-        let (_sys, qm_matrix) = get_cpu_stress(sys, qm_matrix);
+        let (sys, qm_matrix) = get_cpu_stress(sys, qm_matrix);
         let mut qm = 0_f64;
         for metric in qm_matrix {
             qm = qm + (metric.value*metric.weight);
@@ -411,13 +410,11 @@ mod tests {
             }));
         }
 
-        thread::sleep(Duration::from_millis(2200)); //let cpu spin up
+        thread::sleep(Duration::from_millis(200)); //let cpu spin up
         let qm2_matrix = Vec::<MetricElement>::new();
-        let mut sys2 = System::new_all();
-        sys2.refresh_all();
 
         //second measure of CPU
-        let (_sys2, qm2_matrix) = get_cpu_stress(sys2, qm2_matrix);
+        let (_sys, qm2_matrix) = get_cpu_stress(sys, qm2_matrix);
         let mut qm2 = 0_f64;
         for metric in qm2_matrix {
             qm2 = qm2 + (metric.value*metric.weight);
@@ -441,13 +438,12 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
-        let mut sys = System::new_all();
-        sys.refresh_all();
+        let sys = System::new_all();
         let loading = Arc::new(AtomicBool::new(true));
         let qm_matrix = Vec::<MetricElement>::new();
 
         //fist measure of network for benchmark
-        let (_sys, qm_matrix) = get_network_stress(sys, qm_matrix);
+        let (sys, qm_matrix) = get_network_stress(sys, qm_matrix);
         let mut qm = 0_f64;
         for metric in qm_matrix {
             qm = qm + (metric.value*metric.weight);
@@ -469,10 +465,7 @@ mod tests {
         }
 
         let qm2_matrix = Vec::<MetricElement>::new();
-        let mut sys2 = System::new_all();
-        sys2.refresh_all();
-
-        let (_sys2, qm2_matrix) = get_network_stress(sys2, qm2_matrix);
+        let (_sys, qm2_matrix) = get_network_stress(sys, qm2_matrix);
         let mut qm2 = 0_f64;
         for metric in qm2_matrix {
             qm2 = qm2 + (metric.value*metric.weight);
@@ -498,15 +491,13 @@ mod tests {
         use std::fs::OpenOptions;
         use std::time::Duration;
 
-        
-        let mut sys = System::new_all();
-        sys.refresh_all();
+        let sys = System::new_all();
         let loading = Arc::new(AtomicBool::new(true));
         let qm_matrix = Vec::<MetricElement>::new();
         let test_file = "pyrsia_test.txt";
 
         // fist measure of network for benchmark
-        let (_sys, qm_matrix) = get_disk_stress(sys, qm_matrix);
+        let (sys, qm_matrix) = get_disk_stress(sys, qm_matrix);
         let mut qm = 0_f64;
         for metric in qm_matrix {
             qm = qm + (metric.value*metric.weight);
@@ -530,13 +521,11 @@ mod tests {
             }
         });
 
-        thread::sleep(Duration::from_millis(200)); //let writes happen
+        thread::sleep(Duration::from_millis(400)); //let writes happen
         let qm2_matrix = Vec::<MetricElement>::new();
-        let mut sys2 = System::new_all();
-        sys2.refresh_all();
 
         // second measure of network
-        let (_sys2, qm2_matrix) = get_disk_stress(sys2, qm2_matrix);
+        let (_sys, qm2_matrix) = get_disk_stress(sys, qm2_matrix);
         let mut qm2 = 0_f64;
         for metric in qm2_matrix {
             qm2 = qm2 + (metric.value*metric.weight);
@@ -546,7 +535,7 @@ mod tests {
         fs::remove_file(test_file).unwrap_or_else(|why|{
             assert!(false, "{:?}", why.kind());
         });
-        assert!(qm2 >= qm);
+        assert!(qm2 > qm);
 
         //we could add another measure of disks did no think it was that important  
     }
