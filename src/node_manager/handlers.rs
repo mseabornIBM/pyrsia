@@ -239,17 +239,6 @@ fn get_disk_stress(mut sys: System, mut quality_matrix: Vec::<MetricElement>) ->
     (sys, quality_matrix)
 }
 
-//convert a quality code to a string
-fn code_to_string(code: i64) -> String {
-    let string_code = match code {
-        CPU_STRESS_CODE => {String::from("CPU_STRESS_CODE")},
-        NETWORK_STRESS_CODE => {String::from("NETWORK_STRESS_CODE")},
-        DISK_STRESS_CODE => {String::from("DISK_STRESS_CODE")},
-        _ => {String::from("UNKNOWN CODE")}
-    };
-    string_code
-}
-
 #[cfg(test)]
 
 mod tests {
@@ -272,6 +261,7 @@ mod tests {
         0x4f,
     ];
     const CPU_THREADS: usize = 200;
+    const NETWORK_THREADS: usize = 10;
 
     fn tear_down() {
         if Path::new(&env::var("PYRSIA_ARTIFACT_PATH").unwrap()).exists() {
@@ -399,6 +389,7 @@ mod tests {
         sys.refresh_all();
         let loading = Arc::new(AtomicBool::new(true));
 
+        //first measure of CPU for benchmark
         let (_sys, qm_matrix) = get_cpu_stress(sys, qm_matrix);
         let mut qm = 0_f64;
         for metric in qm_matrix {
@@ -406,6 +397,7 @@ mod tests {
         }
         assert_ne!(0_f64,qm); //zero should never be returned here
 
+        //set CPU on fire to measure stress
         let mut threads = vec![];
         for _i in 0..CPU_THREADS {
             threads.push(thread::spawn({
@@ -423,6 +415,8 @@ mod tests {
         let qm2_matrix = Vec::<MetricElement>::new();
         let mut sys2 = System::new_all();
         sys2.refresh_all();
+
+        //second measure of CPU
         let (_sys2, qm2_matrix) = get_cpu_stress(sys2, qm2_matrix);
         let mut qm2 = 0_f64;
         for metric in qm2_matrix {
@@ -430,17 +424,136 @@ mod tests {
         }
 
         assert!(qm2 >= qm);
-        loading.store(false, Ordering::Relaxed);  //kill thread
+        loading.store(false, Ordering::Relaxed);  //kill threads
 
-        //wait for thread
+        //wait for threads
         for thread in threads{
             thread.join().unwrap();
-        }                   
+        }
+        //we could add another measure of CPU did no think it was that important                   
+    }
+
+    #[test]
+    fn network_load_test(){
+        use sysinfo::{System, SystemExt};
+        use std::net::UdpSocket;
+        use std::thread;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let mut sys = System::new_all();
+        sys.refresh_all();
+        let loading = Arc::new(AtomicBool::new(true));
+        let qm_matrix = Vec::<MetricElement>::new();
+
+        //fist measure of network for benchmark
+        let (_sys, qm_matrix) = get_network_stress(sys, qm_matrix);
+        let mut qm = 0_f64;
+        for metric in qm_matrix {
+            qm = qm + (metric.value*metric.weight);
+        }
+
+        //shotgun the network with packets
+        let mut threads = vec![];
+        for i in 0..NETWORK_THREADS {
+            threads.push(thread::spawn({
+                let address: String = format_args!("127.0.0.1:3425{i}").to_string();
+                let socket = UdpSocket::bind(address).expect("couldn't bind to address");
+                let loading_test = loading.clone();
+                move || {
+                    while loading_test.load(Ordering::Relaxed) {
+                        socket.send_to(&[0; 10], "127.0.0.1:4242").expect("couldn't send data");
+                    }
+                }
+            }));
+        }
+
+        let qm2_matrix = Vec::<MetricElement>::new();
+        let mut sys2 = System::new_all();
+        sys2.refresh_all();
+
+        let (_sys2, qm2_matrix) = get_network_stress(sys2, qm2_matrix);
+        let mut qm2 = 0_f64;
+        for metric in qm2_matrix {
+            qm2 = qm2 + (metric.value*metric.weight);
+        }
+        assert!(qm2 > qm);
+        loading.store(false, Ordering::Relaxed);  //kill threads
+
+        //wait for threads
+        for thread in threads{
+            thread.join().unwrap();
+        }
+        //we could add another measure of network did no think it was that important  
+    }
+
+    #[test]
+    fn disk_load_test(){
+        use sysinfo::{System, SystemExt};
+        use std::thread;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::fs;
+        use std::io::Write;
+        use std::fs::OpenOptions;
+        use std::time::Duration;
+
+        
+        let mut sys = System::new_all();
+        sys.refresh_all();
+        let loading = Arc::new(AtomicBool::new(true));
+        let qm_matrix = Vec::<MetricElement>::new();
+        let test_file = "pyrsia_test.txt";
+
+        // fist measure of network for benchmark
+        let (_sys, qm_matrix) = get_disk_stress(sys, qm_matrix);
+        let mut qm = 0_f64;
+        for metric in qm_matrix {
+            qm = qm + (metric.value*metric.weight);
+        }
+
+        // write some data
+        let write_thread = thread::spawn({
+            let file_data = "Some test data for the file!\n";
+            let except_str = format!("Unable to open file {}", test_file).to_string();
+            let mut f = OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(test_file)
+                .expect(&except_str);
+            let loading_test = loading.clone();
+            move || {
+                while loading_test.load(Ordering::Relaxed) {
+                    f.write_all(file_data.as_bytes()).expect("Unable to write data");
+                }
+                drop(f);
+            }
+        });
+
+        thread::sleep(Duration::from_millis(200)); //let writes happen
+        let qm2_matrix = Vec::<MetricElement>::new();
+        let mut sys2 = System::new_all();
+        sys2.refresh_all();
+
+        // second measure of network
+        let (_sys2, qm2_matrix) = get_disk_stress(sys2, qm2_matrix);
+        let mut qm2 = 0_f64;
+        for metric in qm2_matrix {
+            qm2 = qm2 + (metric.value*metric.weight);
+        }
+        loading.store(false, Ordering::Relaxed);  //kill thread
+        write_thread.join().unwrap();
+        fs::remove_file(test_file).unwrap_or_else(|why|{
+            assert!(false, "{:?}", why.kind());
+        });
+        assert!(qm2 >= qm);
+
+        //we could add another measure of disks did no think it was that important  
     }
 
     #[test]
     fn quality_metric_test(){
-        quality_metric = get_quality_metric();
-        assert!(quality_metric != 0);
+        let quality_metric = get_quality_metric();
+        assert!(quality_metric != 0_f64);
     }
 }
