@@ -23,7 +23,9 @@ use libp2p::core::{Multiaddr, PeerId};
 use libp2p::request_response::ResponseChannel;
 use log::debug;
 use std::collections::HashSet;
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::timeout;
 
 /* peer metrics support */
 const PEER_METRIC_THRESHOLD: f64 = 0.5_f64;
@@ -203,9 +205,13 @@ impl Client {
                 })
                 .await?;
 
-            match receiver.await.expect("Sender not to be dropped.") {
+            let dur = Duration::from_millis(500);
+            match timeout(dur, receiver)
+                .await
+                .expect("Sender not to be dropped.")
+            {
                 Ok(peer_metric) => {
-                    let metric: f64 = f64::from_le_bytes(peer_metric.idle_metric);
+                    let metric: f64 = f64::from_le_bytes(peer_metric.unwrap().idle_metric);
                     let idle_metric = IdleMetric {
                         peer: *peer,
                         metric,
