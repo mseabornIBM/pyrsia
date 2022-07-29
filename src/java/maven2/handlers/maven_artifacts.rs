@@ -14,7 +14,8 @@
    limitations under the License.
 */
 
-use crate::artifact_service::service::{ArtifactService, PackageType};
+use crate::artifact_service::model::PackageType;
+use crate::artifact_service::service::ArtifactService;
 use crate::docker::error_util::{RegistryError, RegistryErrorCode};
 use anyhow::bail;
 use log::debug;
@@ -23,8 +24,8 @@ use tokio::sync::Mutex;
 use warp::{http::StatusCode, Rejection, Reply};
 
 pub async fn handle_get_maven_artifact(
-    artifact_service: Arc<Mutex<ArtifactService>>,
     full_path: String,
+    artifact_service: Arc<Mutex<ArtifactService>>,
 ) -> Result<impl Reply, Rejection> {
     debug!("Requesting maven artifact: {}", full_path);
     let package_specific_artifact_id =
@@ -98,8 +99,6 @@ mod tests {
 
     const VALID_ARTIFACT_HASH: &str =
         "e11c16ff163ccc1efe01d2696c626891560fa82123601a5ff196d97b6ab156da";
-    const VALID_SOURCE_HASH: &str =
-        "b6f87982af625a228822adf42d0a091d40e96220b6d4d09a566173b9ea072e34";
     const VALID_FULL_PATH: &str = "/maven2/test/test/1.0/test-1.0.jar";
     const INVALID_FULL_PATH: &str = "/maven2/test/1.0/test-1.0.jar";
     const VALID_MAVEN_ID: &str = "test:test:1.0";
@@ -129,8 +128,9 @@ mod tests {
             local_peer_id: Keypair::generate_ed25519().public().to_peer_id(),
         };
 
-        let mut artifact_service =
-            ArtifactService::new(&tmp_dir, p2p_client).expect("Creating ArtifactService failed");
+        let (build_command_sender, _build_command_receiver) = mpsc::channel(1);
+        let mut artifact_service = ArtifactService::new(&tmp_dir, build_command_sender, p2p_client)
+            .expect("Creating ArtifactService failed");
 
         artifact_service
             .transparency_log_service
@@ -140,7 +140,6 @@ mod tests {
                     package_specific_id: VALID_MAVEN_ID.to_owned(),
                     package_specific_artifact_id: VALID_MAVEN_ARTIFACT_ID.to_owned(),
                     artifact_hash: VALID_ARTIFACT_HASH.to_owned(),
-                    source_hash: VALID_SOURCE_HASH.to_owned(),
                 },
                 add_artifact_sender,
             )
@@ -155,8 +154,8 @@ mod tests {
         .unwrap();
 
         let result = handle_get_maven_artifact(
-            Arc::new(Mutex::new(artifact_service)),
             VALID_FULL_PATH.to_string(),
+            Arc::new(Mutex::new(artifact_service)),
         )
         .await;
 

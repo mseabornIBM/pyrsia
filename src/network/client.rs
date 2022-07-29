@@ -118,13 +118,13 @@ impl Client {
 
     /// Inform the swarm that this node is currently a provider
     /// of the artifact with the specified `artifact_id`.
-    pub async fn provide(&mut self, artifact_id: String) -> anyhow::Result<()> {
+    pub async fn provide(&mut self, artifact_id: &str) -> anyhow::Result<()> {
         debug!("p2p::Client::provide {:?}", artifact_id);
 
         let (sender, receiver) = oneshot::channel();
         self.sender
             .send(Command::Provide {
-                artifact_id,
+                artifact_id: artifact_id.to_owned(),
                 sender,
             })
             .await?;
@@ -260,6 +260,35 @@ impl Client {
 
         Ok(())
     }
+
+    pub async fn request_block_update(
+        &mut self,
+        peer: &PeerId,
+        block_ordinal: u64,
+        block: Vec<u8>,
+    ) -> anyhow::Result<Option<u64>> {
+        debug!(
+            "p2p::Client::request_blockchain {:?}: {:?}={:?}",
+            peer,
+            block_ordinal,
+            block.clone(),
+        );
+
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(Command::RequestBlockUpdate {
+                block_ordinal,
+                block,
+                peer: *peer,
+                sender,
+            })
+            .await?;
+        receiver.await?
+    }
+
+    pub async fn respond_block_update(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -386,7 +415,7 @@ mod tests {
             .map(char::from)
             .collect();
         let cloned_random_artifact_id = random_artifact_id.clone();
-        tokio::spawn(async move { client.provide(random_artifact_id).await });
+        tokio::spawn(async move { client.provide(&random_artifact_id).await });
 
         tokio::select! {
             command = receiver.recv() => match command {
@@ -457,6 +486,36 @@ mod tests {
                     let _ = sender.send(Ok(vec![]));
                 },
                 _ => panic!("Command must match Command::RequestArtifact")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_request_block_update() {
+        let (sender, mut receiver) = mpsc::channel(1);
+
+        let mut client = Client {
+            sender,
+            local_peer_id: Keypair::generate_ed25519().public().to_peer_id(),
+        };
+
+        let other_peer_id = Keypair::generate_ed25519().public().to_peer_id();
+
+        let block = vec![0, 1, 2, 3, 4];
+        tokio::spawn(async move {
+            client
+                .request_block_update(&other_peer_id, 1u64, block)
+                .await
+        });
+
+        tokio::select! {
+            command = receiver.recv() => match command {
+                Some(Command::RequestBlockUpdate { peer, block_ordinal, block, sender:_ }) => {
+                    assert_eq!(peer, other_peer_id);
+                    assert_eq!(block_ordinal, 1u64 );
+                    assert_eq!(block, vec![0, 1, 2, 3, 4]);
+                },
+                _ => panic!("Command must match Command::RequestBlockUpdate")
             }
         }
     }

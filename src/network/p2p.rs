@@ -17,6 +17,7 @@
 use crate::artifact_service::storage::ARTIFACTS_DIR;
 use crate::network::artifact_protocol::{ArtifactExchangeCodec, ArtifactExchangeProtocol};
 use crate::network::behaviour::PyrsiaNetworkBehaviour;
+use crate::network::blockchain_protocol::{BlockUpdateExchangeCodec, BlockUpdateExchangeProtocol};
 use crate::network::client::Client;
 use crate::network::event_loop::{PyrsiaEvent, PyrsiaEventLoop};
 use crate::network::idle_metric_protocol::{IdleMetricExchangeCodec, IdleMetricExchangeProtocol};
@@ -24,6 +25,7 @@ use crate::util::keypair_util;
 
 use libp2p::core;
 use libp2p::dns;
+use libp2p::identify;
 use libp2p::identity;
 use libp2p::kad;
 use libp2p::kad::record::store::{MemoryStore, MemoryStoreConfig};
@@ -31,7 +33,7 @@ use libp2p::mplex;
 use libp2p::noise;
 use libp2p::request_response::{ProtocolSupport, RequestResponse};
 use libp2p::swarm::{Swarm, SwarmBuilder};
-use libp2p::tcp;
+use libp2p::tcp::{self, GenTcpConfig};
 use libp2p::yamux;
 use libp2p::Transport;
 use std::error::Error;
@@ -134,7 +136,7 @@ fn create_transport(
         .into_authentic(&keypair)
         .expect("Signing libp2p-noise static DH keypair failed.");
 
-    let tcp = tcp::TokioTcpConfig::new().nodelay(true);
+    let tcp = tcp::TokioTcpTransport::new(GenTcpConfig::default().nodelay(true));
     let dns = dns::TokioDnsConfig::system(tcp)?;
 
     Ok(dns
@@ -155,6 +157,8 @@ fn create_swarm(
 ) -> Result<(Swarm<PyrsiaNetworkBehaviour>, core::PeerId), Box<dyn Error>> {
     let peer_id = keypair.public().to_peer_id();
 
+    let identify_config = identify::IdentifyConfig::new("ipfs/1.0.0".to_owned(), keypair.public());
+
     let memory_store_config = MemoryStoreConfig {
         max_provided_keys,
         ..Default::default()
@@ -164,6 +168,7 @@ fn create_swarm(
         SwarmBuilder::new(
             create_transport(keypair)?,
             PyrsiaNetworkBehaviour {
+                identify: identify::Identify::new(identify_config),
                 kademlia: kad::Kademlia::new(
                     peer_id,
                     MemoryStore::with_config(peer_id, memory_store_config),
@@ -176,6 +181,11 @@ fn create_swarm(
                 idle_metric_request_response: RequestResponse::new(
                     IdleMetricExchangeCodec(),
                     iter::once((IdleMetricExchangeProtocol(), ProtocolSupport::Full)),
+                    Default::default(),
+                ),
+                block_update_request_response: RequestResponse::new(
+                    BlockUpdateExchangeCodec(),
+                    iter::once((BlockUpdateExchangeProtocol(), ProtocolSupport::Full)),
                     Default::default(),
                 ),
             },

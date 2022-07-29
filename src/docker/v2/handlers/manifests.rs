@@ -14,7 +14,8 @@
    limitations under the License.
 */
 
-use crate::artifact_service::service::{ArtifactService, PackageType};
+use crate::artifact_service::model::PackageType;
+use crate::artifact_service::service::ArtifactService;
 use crate::docker::error_util::{RegistryError, RegistryErrorCode};
 use log::debug;
 use std::sync::Arc;
@@ -24,9 +25,9 @@ use warp::{Rejection, Reply};
 
 // Handles GET endpoint documented at https://docs.docker.com/registry/spec/api/#manifest
 pub async fn fetch_manifest(
-    artifact_service: Arc<Mutex<ArtifactService>>,
     name: String,
     tag: String,
+    artifact_service: Arc<Mutex<ArtifactService>>,
 ) -> Result<impl Reply, Rejection> {
     debug!("Fetching manifest for {} with tag: {}", name, tag);
 
@@ -94,19 +95,20 @@ mod tests {
         let name = "name_manifests";
         let tag = "tag_fetch_manifest_unknown_in_artifact_service";
 
-        let (sender, _) = mpsc::channel(1);
+        let (command_sender, _command_receiver) = mpsc::channel(1);
         let p2p_client = Client {
-            sender,
+            sender: command_sender,
             local_peer_id: Keypair::generate_ed25519().public().to_peer_id(),
         };
 
-        let artifact_service =
-            ArtifactService::new(&tmp_dir, p2p_client).expect("Creating ArtifactService failed");
+        let (build_command_sender, _build_command_receiver) = mpsc::channel(1);
+        let artifact_service = ArtifactService::new(&tmp_dir, build_command_sender, p2p_client)
+            .expect("Creating ArtifactService failed");
 
         let result = fetch_manifest(
-            Arc::new(Mutex::new(artifact_service)),
             name.to_string(),
             tag.to_string(),
+            Arc::new(Mutex::new(artifact_service)),
         )
         .await;
 
@@ -135,14 +137,15 @@ mod tests {
         let package_specific_artifact_id = get_package_specific_artifact_id(name, tag);
 
         let (add_artifact_sender, add_artifact_receiver) = oneshot::channel();
-        let (sender, _) = mpsc::channel(1);
+        let (command_sender, _command_receiver) = mpsc::channel(1);
         let p2p_client = Client {
-            sender,
+            sender: command_sender,
             local_peer_id: Keypair::generate_ed25519().public().to_peer_id(),
         };
 
-        let mut artifact_service =
-            ArtifactService::new(&tmp_dir, p2p_client).expect("Creating ArtifactService failed");
+        let (build_command_sender, _build_command_receiver) = mpsc::channel(1);
+        let mut artifact_service = ArtifactService::new(&tmp_dir, build_command_sender, p2p_client)
+            .expect("Creating ArtifactService failed");
 
         artifact_service
             .transparency_log_service
@@ -152,7 +155,6 @@ mod tests {
                     package_specific_id: package_specific_id.to_owned(),
                     package_specific_artifact_id: package_specific_artifact_id.to_owned(),
                     artifact_hash: hash.to_owned(),
-                    source_hash: hash.to_owned(),
                 },
                 add_artifact_sender,
             )
@@ -168,9 +170,9 @@ mod tests {
         .unwrap();
 
         let result = fetch_manifest(
-            Arc::new(Mutex::new(artifact_service)),
             name.to_string(),
             tag.to_string(),
+            Arc::new(Mutex::new(artifact_service)),
         )
         .await;
 
