@@ -14,7 +14,6 @@
    limitations under the License.
 */
 
-use pyrsia::build_service::model::{BuildInfo, BuildStatus};
 use pyrsia::cli_commands::config;
 use pyrsia::cli_commands::node;
 use pyrsia::node_api::model::cli::{RequestDockerBuild, RequestMavenBuild};
@@ -58,9 +57,9 @@ pub fn config_show() {
     };
 }
 
-pub async fn request_docker_build(manifest: &str) {
+pub async fn request_docker_build(image: &str) {
     let build_result = node::request_docker_build(RequestDockerBuild {
-        manifest: manifest.to_owned(),
+        image: image.to_owned(),
     })
     .await;
     handle_request_build_result(build_result);
@@ -74,27 +73,16 @@ pub async fn request_maven_build(gav: &str) {
     handle_request_build_result(build_result);
 }
 
-fn handle_request_build_result(build_result: Result<BuildInfo, reqwest::Error>) {
+fn handle_request_build_result(build_result: Result<String, reqwest::Error>) {
     match build_result {
-        Ok(build_info) => match build_info.status {
-            BuildStatus::Running => {
-                println!(
-                    "Build request successfully handled. Build with ID {} has been started.",
-                    build_info.id
-                );
-            }
-            BuildStatus::Success { .. } => {
-                println!(
-                    "Build request successfully handled. Build with ID {} already completed.",
-                    build_info.id
-                );
-            }
-            BuildStatus::Failure(msg) => {
-                println!("Build request failed with error: {}", msg);
-            }
-        },
+        Ok(build_id) => {
+            println!(
+                "Build request successfully handled. Build with ID {} has been started.",
+                build_id
+            );
+        }
         Err(error) => {
-            println!("Error: {}", error);
+            println!("Build request failed with error: {}", error);
         }
     }
 }

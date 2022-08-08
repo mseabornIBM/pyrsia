@@ -59,13 +59,18 @@ pub async fn fetch_manifest(
 }
 
 fn get_package_specific_artifact_id(name: &str, tag: &str) -> String {
-    format!("{}::{}", name, tag)
+    if tag.starts_with("sha256:") {
+        format!("{}@{}", name, tag)
+    } else {
+        format!("{}:{}", name, tag)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::artifact_service::storage::ArtifactStorage;
+    use crate::build_service::event::BuildEventClient;
     use crate::network::client::Client;
     use crate::transparency_log::log::AddArtifactRequest;
     use crate::util::test_util;
@@ -78,13 +83,24 @@ mod tests {
     use tokio::sync::{mpsc, oneshot};
 
     #[test]
-    fn test_get_package_specific_artifact_id() {
-        let name = "name_manifests";
-        let tag = "tag";
+    fn test_get_package_specific_artifact_id_from_digest() {
+        let name = "alpine";
+        let tag = "sha256:1e014f84205d569a5cc3be4e108ca614055f7e21d11928946113ab3f36054801";
 
         assert_eq!(
             get_package_specific_artifact_id(name, tag),
-            format!("{}::{}", name, tag)
+            format!("{}@{}", name, tag)
+        );
+    }
+
+    #[test]
+    fn test_get_package_specific_artifact_id_from_tag() {
+        let name = "alpine";
+        let tag = "3.15.3";
+
+        assert_eq!(
+            get_package_specific_artifact_id(name, tag),
+            format!("{}:{}", name, tag)
         );
     }
 
@@ -101,8 +117,9 @@ mod tests {
             local_peer_id: Keypair::generate_ed25519().public().to_peer_id(),
         };
 
-        let (build_command_sender, _build_command_receiver) = mpsc::channel(1);
-        let artifact_service = ArtifactService::new(&tmp_dir, build_command_sender, p2p_client)
+        let (build_event_sender, _build_event_receiver) = mpsc::channel(1);
+        let build_event_client = BuildEventClient::new(build_event_sender);
+        let artifact_service = ArtifactService::new(&tmp_dir, build_event_client, p2p_client)
             .expect("Creating ArtifactService failed");
 
         let result = fetch_manifest(
@@ -143,8 +160,9 @@ mod tests {
             local_peer_id: Keypair::generate_ed25519().public().to_peer_id(),
         };
 
-        let (build_command_sender, _build_command_receiver) = mpsc::channel(1);
-        let mut artifact_service = ArtifactService::new(&tmp_dir, build_command_sender, p2p_client)
+        let (build_event_sender, _build_event_receiver) = mpsc::channel(1);
+        let build_event_client = BuildEventClient::new(build_event_sender);
+        let mut artifact_service = ArtifactService::new(&tmp_dir, build_event_client, p2p_client)
             .expect("Creating ArtifactService failed");
 
         artifact_service
@@ -153,6 +171,7 @@ mod tests {
                 AddArtifactRequest {
                     package_type,
                     package_specific_id: package_specific_id.to_owned(),
+                    num_artifacts: 8,
                     package_specific_artifact_id: package_specific_artifact_id.to_owned(),
                     artifact_hash: hash.to_owned(),
                 },
