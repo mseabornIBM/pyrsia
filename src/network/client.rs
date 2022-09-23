@@ -17,8 +17,10 @@
 pub mod command;
 
 use crate::network::artifact_protocol::ArtifactResponse;
+use crate::network::blockchain_protocol::BlockchainResponse;
 use crate::network::client::command::Command;
 use crate::network::idle_metric_protocol::{IdleMetricResponse, PeerMetrics};
+use crate::node_api::model::cli::Status;
 use libp2p::core::{Multiaddr, PeerId};
 use libp2p::request_response::ResponseChannel;
 use log::debug;
@@ -68,13 +70,35 @@ impl From<&str> for ArtifactHash {
 }
 
 /// The `Client` provides entry points to interact with the libp2p swarm.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Client {
     pub sender: mpsc::Sender<Command>,
     pub local_peer_id: PeerId,
 }
 
 impl Client {
+    // Add a probe address for AutoNAT discovery
+    pub async fn add_probe_address(
+        &mut self,
+        peer_id: &PeerId,
+        probe_addr: &Multiaddr,
+    ) -> anyhow::Result<()> {
+        debug!(
+            "p2p::Client::add_probe_address {:?} {:?}",
+            peer_id, probe_addr
+        );
+
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(Command::AddProbe {
+                peer_id: *peer_id,
+                probe_addr: probe_addr.clone(),
+                sender,
+            })
+            .await?;
+        Ok(receiver.await?)
+    }
+
     /// Instruct the swarm to start listening on the specified address.
     pub async fn listen(&mut self, addr: &Multiaddr) -> anyhow::Result<()> {
         debug!("p2p::Client::listen {:?}", addr);
@@ -113,6 +137,13 @@ impl Client {
                 sender,
             })
             .await?;
+        Ok(receiver.await?)
+    }
+
+    /// Get the status of the node including nearby peers cnt and my peer addrs
+    pub async fn status(&mut self) -> anyhow::Result<Status> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender.send(Command::Status { sender }).await?;
         Ok(receiver.await?)
     }
 
@@ -261,24 +292,17 @@ impl Client {
         Ok(())
     }
 
-    pub async fn request_block_update(
+    pub async fn request_blockchain(
         &mut self,
         peer: &PeerId,
-        block_ordinal: u64,
-        block: Vec<u8>,
-    ) -> anyhow::Result<Option<u64>> {
-        debug!(
-            "p2p::Client::request_blockchain {:?}: {:?}={:?}",
-            peer,
-            block_ordinal,
-            block.clone(),
-        );
+        data: Vec<u8>,
+    ) -> anyhow::Result<Vec<u8>> {
+        debug!("p2p::Client::request_blockchain {:?} form {:?}", data, peer);
 
         let (sender, receiver) = oneshot::channel();
         self.sender
-            .send(Command::RequestBlockUpdate {
-                block_ordinal,
-                block,
+            .send(Command::RequestBlockchain {
+                data,
                 peer: *peer,
                 sender,
             })
@@ -286,15 +310,28 @@ impl Client {
         receiver.await?
     }
 
-    pub async fn respond_block_update(&mut self) -> anyhow::Result<()> {
+    pub async fn respond_blockchain(
+        &mut self,
+        data: Vec<u8>,
+        channel: ResponseChannel<BlockchainResponse>,
+    ) -> anyhow::Result<()> {
+        debug!("p2p::Client::repond_blockchain {:?}", data);
+
+        self.sender
+            .send(Command::RespondBlockchain { data, channel })
+            .await?;
+
         Ok(())
     }
 }
 
 #[cfg(test)]
+#[cfg(not(tarpaulin_include))]
 mod tests {
     use super::*;
-    use libp2p::identity::Keypair;
+    use libp2p::identity::{self, Keypair};
+    use pyrsia_blockchain_network::crypto::hash_algorithm::HashDigest;
+    use pyrsia_blockchain_network::structures::block::Block;
     use rand::distributions::Alphanumeric;
     use rand::{thread_rng, Rng};
 
@@ -367,6 +404,28 @@ mod tests {
                     let _ = sender.send(Default::default());
                 },
                 _ => panic!("Command must match Command::ListPeers")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_status() {
+        let (sender, mut receiver) = mpsc::channel(1);
+
+        let local_peer_id = Keypair::generate_ed25519().public().to_peer_id();
+        let mut client = Client {
+            sender,
+            local_peer_id,
+        };
+
+        tokio::spawn(async move { client.status().await });
+
+        tokio::select! {
+            command = receiver.recv() => match command {
+                Some(Command::Status { sender }) => {
+                    let _ = sender.send(Default::default());
+                },
+                _ => panic!("Command must match Command::Status")
             }
         }
     }
@@ -491,31 +550,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_request_block_update() {
+    async fn test_request_blockchain() {
         let (sender, mut receiver) = mpsc::channel(1);
+        let local_key = identity::ed25519::Keypair::generate();
 
         let mut client = Client {
             sender,
-            local_peer_id: Keypair::generate_ed25519().public().to_peer_id(),
+            local_peer_id: identity::PublicKey::Ed25519(local_key.public()).to_peer_id(),
         };
 
         let other_peer_id = Keypair::generate_ed25519().public().to_peer_id();
 
-        let block = vec![0, 1, 2, 3, 4];
-        tokio::spawn(async move {
-            client
-                .request_block_update(&other_peer_id, 1u64, block)
-                .await
-        });
+        let block = Block::new(HashDigest::new(b""), 0, vec![], &local_key);
+
+        let mut buf: Vec<u8> = vec![1u8];
+        buf.append(&mut bincode::serialize(&(1 as u128)).unwrap());
+        buf.append(&mut bincode::serialize(&block).unwrap());
+
+        tokio::spawn(async move { client.request_blockchain(&other_peer_id, buf.clone()).await });
 
         tokio::select! {
             command = receiver.recv() => match command {
-                Some(Command::RequestBlockUpdate { peer, block_ordinal, block, sender:_ }) => {
+                Some(Command::RequestBlockchain { peer, data, sender:_ }) => {
                     assert_eq!(peer, other_peer_id);
-                    assert_eq!(block_ordinal, 1u64 );
-                    assert_eq!(block, vec![0, 1, 2, 3, 4]);
+                    assert_eq!(1u8, data[0]);
                 },
-                _ => panic!("Command must match Command::RequestBlockUpdate")
+                _ => panic!("Command must match Command::RequestBlockchain")
             }
         }
     }

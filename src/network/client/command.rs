@@ -15,7 +15,9 @@
 */
 
 use crate::network::artifact_protocol::ArtifactResponse;
+use crate::network::blockchain_protocol::BlockchainResponse;
 use crate::network::idle_metric_protocol::{IdleMetricResponse, PeerMetrics};
+use crate::node_api::model::cli::Status;
 use libp2p::core::{Multiaddr, PeerId};
 use libp2p::request_response::ResponseChannel;
 use std::collections::HashSet;
@@ -27,6 +29,11 @@ use tokio::sync::oneshot;
 /// defined in `Client`.
 #[derive(Debug, Display)]
 pub enum Command {
+    AddProbe {
+        peer_id: PeerId,
+        probe_addr: Multiaddr,
+        sender: oneshot::Sender<()>,
+    },
     Listen {
         addr: Multiaddr,
         sender: oneshot::Sender<anyhow::Result<()>>,
@@ -39,6 +46,9 @@ pub enum Command {
     ListPeers {
         peer_id: PeerId,
         sender: oneshot::Sender<HashSet<PeerId>>,
+    },
+    Status {
+        sender: oneshot::Sender<Status>,
     },
     Provide {
         artifact_id: String,
@@ -65,16 +75,19 @@ pub enum Command {
         metric: PeerMetrics,
         channel: ResponseChannel<IdleMetricResponse>,
     },
-    RequestBlockUpdate {
-        block_ordinal: u64,
-        block: Vec<u8>,
+    RequestBlockchain {
+        data: Vec<u8>,
         peer: PeerId,
-        sender: oneshot::Sender<anyhow::Result<Option<u64>>>,
+        sender: oneshot::Sender<anyhow::Result<Vec<u8>>>,
     },
-    RespondBlockUpdate(),
+    RespondBlockchain {
+        data: Vec<u8>,
+        channel: ResponseChannel<BlockchainResponse>,
+    },
 }
 
 #[cfg(test)]
+#[cfg(not(tarpaulin_include))]
 mod tests {
     use super::*;
 

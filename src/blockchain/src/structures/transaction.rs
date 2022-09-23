@@ -88,6 +88,7 @@ pub struct Transaction {
     hash: HashDigest,
     signature: TransactionSignature,
 }
+
 impl Transaction {
     pub fn new(
         type_id: TransactionType,
@@ -124,6 +125,7 @@ impl Transaction {
 }
 
 #[cfg(test)]
+#[cfg(not(tarpaulin_include))]
 mod tests {
     use super::*;
 

@@ -111,6 +111,7 @@ impl PipelineService {
 }
 
 #[cfg(test)]
+#[cfg(not(tarpaulin_include))]
 mod tests {
     use super::*;
     use crate::artifact_service::model::PackageType;
@@ -191,8 +192,7 @@ mod tests {
 
         let pipeline_service = PipelineService::new(&http_server.url("/").to_string());
 
-        let a = pipeline_service.start_build(mapping_info).await.unwrap();
-        println!("ID: {:?}", a);
+        pipeline_service.start_build(mapping_info).await.unwrap();
     }
 
     #[tokio::test]

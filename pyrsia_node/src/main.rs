@@ -22,6 +22,7 @@ use args::parser::PyrsiaNodeArgs;
 use network::handlers;
 use pyrsia::artifact_service::service::ArtifactService;
 use pyrsia::artifact_service::storage::ARTIFACTS_DIR;
+use pyrsia::blockchain_service::service::BlockchainService;
 use pyrsia::build_service::event::{BuildEventClient, BuildEventLoop};
 use pyrsia::build_service::service::BuildService;
 use pyrsia::docker::error_util::*;
@@ -31,9 +32,9 @@ use pyrsia::logging::*;
 use pyrsia::network::client::Client;
 use pyrsia::network::p2p;
 use pyrsia::node_api::routes::make_node_routes;
+use pyrsia::transparency_log::log::TransparencyLogService;
 use pyrsia::util::keypair_util::{self, KEYPAIR_FILENAME};
 use pyrsia::verification_service::service::VerificationService;
-use pyrsia_blockchain_network::blockchain::Blockchain;
 
 use clap::Parser;
 use log::{debug, info, warn};
@@ -55,17 +56,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
     debug!("Create p2p components");
     let (p2p_client, mut p2p_events, event_loop) = p2p::setup_libp2p_swarm(args.max_provided_keys)?;
 
-    debug!("Create blockchain components");
-    let blockchain = setup_blockchain()?;
-
     debug!("Start p2p event loop");
     tokio::spawn(event_loop.run());
 
+    debug!("Create blockchain service component");
+    let blockchain_service = setup_blockchain_service(p2p_client.clone())?;
+
+    debug!("Create transparency log service");
+    let transparency_log_service = setup_transparency_log_service(blockchain_service.clone())?;
+
     debug!("Create pyrsia services");
-    let artifact_service = setup_pyrsia_services(p2p_client.clone(), &args)?;
+    let (build_event_client, artifact_service) =
+        setup_pyrsia_services(transparency_log_service.clone(), p2p_client.clone(), &args).await?;
 
     debug!("Setup HTTP server");
-    setup_http(&args, artifact_service.clone());
+    setup_http(
+        &args,
+        artifact_service.clone(),
+        transparency_log_service,
+        build_event_client,
+        p2p_client.clone(),
+    );
 
     debug!("Start p2p components");
     setup_p2p(p2p_client.clone(), &args).await?;
@@ -102,15 +113,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         );
                     }
                 }
-                pyrsia::network::event_loop::PyrsiaEvent::BlockUpdateRequest {
-                    block_ordinal,
-                    block,
-                } => {
-                    if let Err(error) = handlers::handle_request_block_update(
-                        p2p_client.clone(),
-                        blockchain.clone(),
-                        block_ordinal,
-                        block.clone(),
+                pyrsia::network::event_loop::PyrsiaEvent::BlockchainRequest { data, channel } => {
+                    if let Err(error) = handlers::handle_request_blockchain(
+                        artifact_service.clone(),
+                        blockchain_service.clone(),
+                        data,
+                        channel,
                     )
                     .await
                     {
@@ -122,17 +130,70 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
-async fn setup_p2p(mut p2p_client: Client, args: &PyrsiaNodeArgs) -> Result<()> {
+async fn setup_p2p(mut p2p_client: Client, args: &PyrsiaNodeArgs) -> anyhow::Result<()> {
     p2p_client.listen(&args.listen_address).await?;
-
-    if let Some(to_dial) = &args.peer {
+    if let Some(to_probe) = &args.probe {
+        info!("Invoking probe");
+        handlers::probe_other_peer(p2p_client.clone(), to_probe).await
+    } else if let Some(to_dial) = &args.peer {
+        info!("Invoking dial");
         handlers::dial_other_peer(p2p_client.clone(), to_dial).await
-    } else {
+    } else if args.listen_only {
+        info!("Pyrsia node will listen only. No attempt to connect to other nodes.");
         Ok(())
+    } else {
+        info!("Looking up bootstrap node");
+        let peer_addrs = load_peer_addrs(&args.bootstrap_url).await?;
+        // Turbofish! https://doc.rust-lang.org/std/primitive.str.html#method.parse
+        let pa = peer_addrs.parse::<libp2p::Multiaddr>()?;
+        info!("Probing {:?}", pa);
+        handlers::probe_other_peer(p2p_client.clone(), &pa).await
     }
 }
 
-fn setup_blockchain() -> Result<Arc<Mutex<Blockchain>>> {
+async fn load_peer_addrs(peer_url: &str) -> anyhow::Result<String> {
+    use anyhow::anyhow;
+
+    let client = reqwest::Client::new();
+    let response = client.get(peer_url).send().await;
+    match response {
+        Ok(body) => {
+            let text: String = body.text().await?;
+            let jv: json::JsonValue = json::parse(&text)?;
+            let arr = &jv["peer_addrs"];
+            match arr {
+                json::JsonValue::Array(vec_jv) => {
+                    if vec_jv.is_empty() {
+                        return Err(anyhow!(
+                            "Could not read status from {} error {:?}",
+                            peer_url,
+                            "did not receive a valid array of peer_addrs in JSON"
+                        ));
+                    }
+                    let peer_addrs: String = vec_jv[0].to_string();
+                    info!("Found bootstrap peer_addr {:?}", peer_addrs);
+                    if !peer_addrs.is_empty() {
+                        Ok(peer_addrs)
+                    } else {
+                        Err(anyhow!("Could not read peer_addrs from {}", peer_url))
+                    }
+                }
+                _ => Err(anyhow!(
+                    "Could not read status from {} error {:?}",
+                    peer_url,
+                    "did not receive an array of peer_addrs in JSON"
+                )),
+            }
+        }
+        Err(err) => Err(anyhow!(
+            "Could not read status from {} error {:?}",
+            peer_url,
+            err
+        )),
+    }
+}
+
+fn setup_blockchain_service(p2p_client: Client) -> Result<Arc<Mutex<BlockchainService>>> {
     let local_keypair =
         keypair_util::load_or_generate_ed25519(PathBuf::from(KEYPAIR_FILENAME.as_str()));
 
@@ -143,26 +204,46 @@ fn setup_blockchain() -> Result<Arc<Mutex<Blockchain>>> {
         }
     };
 
-    Ok(Arc::new(Mutex::new(Blockchain::new(&ed25519_keypair))))
+    Ok(Arc::new(Mutex::new(BlockchainService::new(
+        &ed25519_keypair,
+        p2p_client,
+    ))))
 }
 
-fn setup_pyrsia_services(
+fn setup_transparency_log_service(
+    blockchain_service: Arc<Mutex<BlockchainService>>,
+) -> Result<TransparencyLogService> {
+    let artifact_path = PathBuf::from(ARTIFACTS_DIR.as_str());
+
+    let transparency_log_service = TransparencyLogService::new(&artifact_path, blockchain_service)?;
+
+    Ok(transparency_log_service)
+}
+
+async fn setup_pyrsia_services(
+    transparency_log_service: TransparencyLogService,
     p2p_client: Client,
     args: &PyrsiaNodeArgs,
-) -> Result<Arc<Mutex<ArtifactService>>> {
+) -> Result<(BuildEventClient, ArtifactService)> {
     let artifact_path = PathBuf::from(ARTIFACTS_DIR.as_str());
+
+    debug!("Create build event client");
     let (build_event_sender, build_event_receiver) = mpsc::channel(32);
     let build_event_client = BuildEventClient::new(build_event_sender);
 
     debug!("Create artifact service");
-    let artifact_service =
-        setup_artifact_service(&artifact_path, build_event_client.clone(), p2p_client)?;
+    let artifact_service = setup_artifact_service(
+        &artifact_path,
+        transparency_log_service,
+        build_event_client.clone(),
+        p2p_client,
+    )?;
 
     debug!("Create build service");
     let build_service = setup_build_service(&artifact_path, build_event_client.clone(), args)?;
 
     debug!("Create verification service");
-    let verification_service = setup_verification_service(build_event_client)?;
+    let verification_service = VerificationService::new(build_event_client.clone())?;
 
     debug!("Start build event loop");
     let build_event_loop = BuildEventLoop::new(
@@ -173,24 +254,30 @@ fn setup_pyrsia_services(
     );
     tokio::spawn(build_event_loop.run());
 
-    Ok(artifact_service)
+    Ok((build_event_client, artifact_service))
 }
 
 fn setup_artifact_service(
     artifact_path: &Path,
+    transparency_log_service: TransparencyLogService,
     build_event_client: BuildEventClient,
     p2p_client: Client,
-) -> Result<Arc<Mutex<ArtifactService>>> {
-    let artifact_service = ArtifactService::new(artifact_path, build_event_client, p2p_client)?;
+) -> Result<ArtifactService> {
+    let artifact_service = ArtifactService::new(
+        artifact_path,
+        transparency_log_service,
+        build_event_client,
+        p2p_client,
+    )?;
 
-    Ok(Arc::new(Mutex::new(artifact_service)))
+    Ok(artifact_service)
 }
 
 fn setup_build_service(
     artifact_path: &Path,
     build_event_client: BuildEventClient,
     args: &PyrsiaNodeArgs,
-) -> Result<Arc<Mutex<BuildService>>> {
+) -> Result<BuildService> {
     let build_service = BuildService::new(
         &artifact_path,
         build_event_client,
@@ -198,18 +285,16 @@ fn setup_build_service(
         &args.pipeline_service_endpoint,
     )?;
 
-    Ok(Arc::new(Mutex::new(build_service)))
+    Ok(build_service)
 }
 
-fn setup_verification_service(
+fn setup_http(
+    args: &PyrsiaNodeArgs,
+    artifact_service: ArtifactService,
+    transparency_log_service: TransparencyLogService,
     build_event_client: BuildEventClient,
-) -> Result<Arc<Mutex<VerificationService>>> {
-    let verification_service = VerificationService::new(build_event_client)?;
-
-    Ok(Arc::new(Mutex::new(verification_service)))
-}
-
-fn setup_http(args: &PyrsiaNodeArgs, artifact_service: Arc<Mutex<ArtifactService>>) {
+    p2p_client: Client,
+) {
     // Get host and port from the settings. Defaults to DEFAULT_HOST and DEFAULT_PORT
     debug!(
         "Pyrsia Docker Node will bind to host = {}, port = {}",
@@ -223,8 +308,9 @@ fn setup_http(args: &PyrsiaNodeArgs, artifact_service: Arc<Mutex<ArtifactService
 
     debug!("Setup HTTP routing");
     let docker_routes = make_docker_routes(artifact_service.clone());
-    let maven_routes = make_maven_routes(artifact_service.clone());
-    let node_api_routes = make_node_routes(artifact_service);
+    let maven_routes = make_maven_routes(artifact_service);
+    let node_api_routes =
+        make_node_routes(build_event_client, p2p_client, transparency_log_service);
     let all_routes = docker_routes.or(maven_routes).or(node_api_routes);
 
     debug!("Setup HTTP server");
@@ -246,12 +332,16 @@ fn setup_http(args: &PyrsiaNodeArgs, artifact_service: Arc<Mutex<ArtifactService
 }
 
 #[cfg(test)]
+#[cfg(not(tarpaulin_include))]
 mod tests {
-    use crate::setup_blockchain;
+    use pyrsia::network::p2p;
+
+    use crate::setup_blockchain_service;
 
     #[test]
     fn setup_blockchain_success() {
-        let blockchain = setup_blockchain();
-        assert!(blockchain.is_ok());
+        let (p2p_client, _, _) = p2p::setup_libp2p_swarm(100).unwrap();
+        let blockchain_service = setup_blockchain_service(p2p_client.clone());
+        assert!(blockchain_service.is_ok());
     }
 }

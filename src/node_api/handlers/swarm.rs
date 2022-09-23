@@ -15,23 +15,23 @@
 */
 
 use crate::artifact_service::model::PackageType;
-use crate::artifact_service::service::ArtifactService;
+use crate::build_service::event::BuildEventClient;
 use crate::docker::error_util::RegistryError;
-use crate::node_api::model::cli::{RequestDockerBuild, RequestMavenBuild, Status};
+use crate::network::client::Client;
+use crate::node_api::model::cli::{
+    RequestDockerBuild, RequestDockerLog, RequestMavenBuild, RequestMavenLog,
+};
+use crate::transparency_log::log::TransparencyLogService;
 
 use log::debug;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use warp::{http::StatusCode, Rejection, Reply};
 
 pub async fn handle_build_docker(
     request_docker_build: RequestDockerBuild,
-    artifact_service: Arc<Mutex<ArtifactService>>,
+    build_event_client: BuildEventClient,
 ) -> Result<impl Reply, Rejection> {
-    let build_id = artifact_service
-        .lock()
-        .await
-        .request_build(PackageType::Docker, request_docker_build.image)
+    let build_id = build_event_client
+        .start_build(PackageType::Docker, request_docker_build.image)
         .await
         .map_err(RegistryError::from)?;
 
@@ -45,12 +45,10 @@ pub async fn handle_build_docker(
 
 pub async fn handle_build_maven(
     request_maven_build: RequestMavenBuild,
-    artifact_service: Arc<Mutex<ArtifactService>>,
+    build_event_client: BuildEventClient,
 ) -> Result<impl Reply, Rejection> {
-    let build_id = artifact_service
-        .lock()
-        .await
-        .request_build(PackageType::Maven2, request_maven_build.gav)
+    let build_id = build_event_client
+        .start_build(PackageType::Maven2, request_maven_build.gav)
         .await
         .map_err(RegistryError::from)?;
 
@@ -62,16 +60,8 @@ pub async fn handle_build_maven(
         .body(build_id_as_json))
 }
 
-pub async fn handle_get_peers(
-    artifact_service: Arc<Mutex<ArtifactService>>,
-) -> Result<impl Reply, Rejection> {
-    let peers = artifact_service
-        .lock()
-        .await
-        .p2p_client
-        .list_peers()
-        .await
-        .map_err(RegistryError::from)?;
+pub async fn handle_get_peers(mut p2p_client: Client) -> Result<impl Reply, Rejection> {
+    let peers = p2p_client.list_peers().await.map_err(RegistryError::from)?;
     debug!("Got received_peers: {:?}", peers);
 
     let str_peers: Vec<String> = peers.into_iter().map(|p| p.to_string()).collect();
@@ -84,20 +74,8 @@ pub async fn handle_get_peers(
         .unwrap())
 }
 
-pub async fn handle_get_status(
-    artifact_service: Arc<Mutex<ArtifactService>>,
-) -> Result<impl Reply, Rejection> {
-    let mut artifact_service = artifact_service.lock().await;
-    let peers = artifact_service
-        .p2p_client
-        .list_peers()
-        .await
-        .map_err(RegistryError::from)?;
-
-    let status = Status {
-        peers_count: peers.len(),
-        peer_id: artifact_service.p2p_client.local_peer_id.to_string(),
-    };
+pub async fn handle_get_status(mut p2p_client: Client) -> Result<impl Reply, Rejection> {
+    let status = p2p_client.status().await.map_err(RegistryError::from)?;
 
     let status_as_json = serde_json::to_string(&status).unwrap();
 
@@ -105,5 +83,39 @@ pub async fn handle_get_status(
         .header("Content-Type", "application/json")
         .status(StatusCode::OK)
         .body(status_as_json)
+        .unwrap())
+}
+
+pub async fn handle_inspect_log_docker(
+    request_docker_log: RequestDockerLog,
+    transparency_log_service: TransparencyLogService,
+) -> Result<impl Reply, Rejection> {
+    let result = transparency_log_service
+        .search_transparency_logs(&PackageType::Docker, &request_docker_log.image)
+        .map_err(RegistryError::from)?;
+
+    let result_as_json = serde_json::to_string(&result).map_err(RegistryError::from)?;
+
+    Ok(warp::http::response::Builder::new()
+        .header("Content-Type", "application/json")
+        .status(StatusCode::OK)
+        .body(result_as_json)
+        .unwrap())
+}
+
+pub async fn handle_inspect_log_maven(
+    request_maven_log: RequestMavenLog,
+    transparency_log_service: TransparencyLogService,
+) -> Result<impl Reply, Rejection> {
+    let result = transparency_log_service
+        .search_transparency_logs(&PackageType::Maven2, &request_maven_log.gav)
+        .map_err(RegistryError::from)?;
+
+    let result_as_json = serde_json::to_string(&result).map_err(RegistryError::from)?;
+
+    Ok(warp::http::response::Builder::new()
+        .header("Content-Type", "application/json")
+        .status(StatusCode::OK)
+        .body(result_as_json)
         .unwrap())
 }

@@ -108,7 +108,7 @@ impl Header {
         parent_hash: HashDigest,
         transactions_hash: HashDigest,
         committer: Address,
-        ordinal: u128,
+        ordinal: Ordinal,
     ) -> Self {
         let partial = PartialHeader {
             parent_hash,
@@ -138,6 +138,7 @@ impl Header {
 }
 
 #[cfg(test)]
+#[cfg(not(tarpaulin_include))]
 mod tests {
     use super::*;
     use libp2p::identity;

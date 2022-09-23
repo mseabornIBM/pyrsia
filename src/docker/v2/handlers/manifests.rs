@@ -18,8 +18,6 @@ use crate::artifact_service::model::PackageType;
 use crate::artifact_service::service::ArtifactService;
 use crate::docker::error_util::{RegistryError, RegistryErrorCode};
 use log::debug;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use warp::http::StatusCode;
 use warp::{Rejection, Reply};
 
@@ -27,13 +25,11 @@ use warp::{Rejection, Reply};
 pub async fn fetch_manifest(
     name: String,
     tag: String,
-    artifact_service: Arc<Mutex<ArtifactService>>,
+    mut artifact_service: ArtifactService,
 ) -> Result<impl Reply, Rejection> {
     debug!("Fetching manifest for {} with tag: {}", name, tag);
 
     let manifest_content = artifact_service
-        .lock()
-        .await
         .get_artifact(
             PackageType::Docker,
             &get_package_specific_artifact_id(&name, &tag),
@@ -67,20 +63,59 @@ fn get_package_specific_artifact_id(name: &str, tag: &str) -> String {
 }
 
 #[cfg(test)]
+#[cfg(not(tarpaulin_include))]
 mod tests {
     use super::*;
-    use crate::artifact_service::storage::ArtifactStorage;
+    use crate::blockchain_service::service::BlockchainService;
     use crate::build_service::event::BuildEventClient;
+    use crate::network::client::command::Command;
     use crate::network::client::Client;
     use crate::transparency_log::log::AddArtifactRequest;
     use crate::util::test_util;
+    use crate::{
+        artifact_service::storage::ArtifactStorage, transparency_log::log::TransparencyLogService,
+    };
     use anyhow::Context;
     use hyper::header::HeaderValue;
     use libp2p::identity::Keypair;
     use std::borrow::Borrow;
+    use std::collections::HashSet;
     use std::fs::File;
-    use std::path::PathBuf;
-    use tokio::sync::{mpsc, oneshot};
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use tokio::sync::{mpsc, Mutex};
+
+    fn create_p2p_client(local_keypair: &Keypair) -> (mpsc::Receiver<Command>, Client) {
+        let (command_sender, command_receiver) = mpsc::channel(1);
+        let p2p_client = Client {
+            sender: command_sender,
+            local_peer_id: local_keypair.public().to_peer_id(),
+        };
+
+        (command_receiver, p2p_client)
+    }
+
+    fn create_blockchain_service(local_keypair: &Keypair, p2p_client: Client) -> BlockchainService {
+        let ed25519_keypair = match local_keypair {
+            libp2p::identity::Keypair::Ed25519(ref v) => v,
+            _ => {
+                panic!("Keypair Format Error");
+            }
+        };
+
+        BlockchainService::new(ed25519_keypair, p2p_client)
+    }
+
+    fn create_transparency_log_service<P: AsRef<Path>>(
+        artifact_path: P,
+        local_keypair: Keypair,
+        p2p_client: Client,
+    ) -> TransparencyLogService {
+        let blockchain_service = create_blockchain_service(&local_keypair, p2p_client);
+
+        TransparencyLogService::new(artifact_path, Arc::new(Mutex::new(blockchain_service)))
+            .expect("Creating TransparencyLogService failed")
+    }
 
     #[test]
     fn test_get_package_specific_artifact_id_from_digest() {
@@ -111,23 +146,22 @@ mod tests {
         let name = "name_manifests";
         let tag = "tag_fetch_manifest_unknown_in_artifact_service";
 
-        let (command_sender, _command_receiver) = mpsc::channel(1);
-        let p2p_client = Client {
-            sender: command_sender,
-            local_peer_id: Keypair::generate_ed25519().public().to_peer_id(),
-        };
+        let local_keypair = Keypair::generate_ed25519();
+        let (_command_receiver, p2p_client) = create_p2p_client(&local_keypair);
+        let transparency_log_service =
+            create_transparency_log_service(&tmp_dir, local_keypair, p2p_client.clone());
 
         let (build_event_sender, _build_event_receiver) = mpsc::channel(1);
         let build_event_client = BuildEventClient::new(build_event_sender);
-        let artifact_service = ArtifactService::new(&tmp_dir, build_event_client, p2p_client)
-            .expect("Creating ArtifactService failed");
-
-        let result = fetch_manifest(
-            name.to_string(),
-            tag.to_string(),
-            Arc::new(Mutex::new(artifact_service)),
+        let artifact_service = ArtifactService::new(
+            &tmp_dir,
+            transparency_log_service,
+            build_event_client,
+            p2p_client,
         )
-        .await;
+        .expect("Creating ArtifactService failed");
+
+        let result = fetch_manifest(name.to_string(), tag.to_string(), artifact_service).await;
 
         assert!(result.is_err());
         let rejection = result.err().unwrap();
@@ -153,34 +187,47 @@ mod tests {
         let package_specific_id = format!("{}:{}", name, tag);
         let package_specific_artifact_id = get_package_specific_artifact_id(name, tag);
 
-        let (add_artifact_sender, add_artifact_receiver) = oneshot::channel();
-        let (command_sender, _command_receiver) = mpsc::channel(1);
-        let p2p_client = Client {
-            sender: command_sender,
-            local_peer_id: Keypair::generate_ed25519().public().to_peer_id(),
-        };
+        let local_keypair = Keypair::generate_ed25519();
+        let (mut command_receiver, p2p_client) = create_p2p_client(&local_keypair);
+        let transparency_log_service =
+            create_transparency_log_service(&tmp_dir, local_keypair, p2p_client.clone());
+
+        tokio::spawn(async move {
+            loop {
+                match command_receiver.recv().await {
+                    Some(Command::ListPeers { sender, .. }) => {
+                        let _ = sender.send(HashSet::new());
+                    }
+                    _ => panic!("Command must match Command::ListPeers"),
+                }
+            }
+        });
 
         let (build_event_sender, _build_event_receiver) = mpsc::channel(1);
         let build_event_client = BuildEventClient::new(build_event_sender);
-        let mut artifact_service = ArtifactService::new(&tmp_dir, build_event_client, p2p_client)
-            .expect("Creating ArtifactService failed");
+        let mut artifact_service = ArtifactService::new(
+            &tmp_dir,
+            transparency_log_service,
+            build_event_client,
+            p2p_client,
+        )
+        .expect("Creating ArtifactService failed");
 
-        artifact_service
+        let transparency_log = artifact_service
             .transparency_log_service
-            .add_artifact(
-                AddArtifactRequest {
-                    package_type,
-                    package_specific_id: package_specific_id.to_owned(),
-                    num_artifacts: 8,
-                    package_specific_artifact_id: package_specific_artifact_id.to_owned(),
-                    artifact_hash: hash.to_owned(),
-                },
-                add_artifact_sender,
-            )
+            .add_artifact(AddArtifactRequest {
+                package_type,
+                package_specific_id: package_specific_id.to_owned(),
+                num_artifacts: 8,
+                package_specific_artifact_id: package_specific_artifact_id.to_owned(),
+                artifact_hash: hash.to_owned(),
+            })
             .await
             .unwrap();
-
-        let transparency_log = add_artifact_receiver.await.unwrap().unwrap();
+        artifact_service
+            .transparency_log_service
+            .write_transparency_log(&transparency_log)
+            .unwrap();
 
         create_artifact(
             &artifact_service.artifact_storage,
@@ -188,12 +235,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = fetch_manifest(
-            name.to_string(),
-            tag.to_string(),
-            Arc::new(Mutex::new(artifact_service)),
-        )
-        .await;
+        let result = fetch_manifest(name.to_string(), tag.to_string(), artifact_service).await;
 
         assert!(result.is_ok());
 

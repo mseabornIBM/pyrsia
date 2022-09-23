@@ -16,10 +16,11 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct Status {
     pub peers_count: usize,
     pub peer_id: String,
+    pub peer_addrs: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -28,6 +29,16 @@ pub struct RequestDockerBuild {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+pub struct RequestDockerLog {
+    pub image: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 pub struct RequestMavenBuild {
+    pub gav: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct RequestMavenLog {
     pub gav: String,
 }

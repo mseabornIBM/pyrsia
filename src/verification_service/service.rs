@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use thiserror::Error;
 use tokio::sync::oneshot;
 
-#[derive(Clone, Debug, Error, PartialEq)]
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum VerificationError {
     #[error("Artifact with specific id {artifact_specific_id} was not found in build {build_id}.")]
     ArtifactNotFound {
@@ -118,7 +118,9 @@ impl VerificationService {
         sender: oneshot::Sender<Result<(), VerificationError>>,
     ) -> Result<Option<String>, VerificationError> {
         let package = Package {
-            package_type: transparency_log.package_type,
+            package_type: transparency_log
+                .package_type
+                .expect("Package type should not be empty"),
             package_specific_id: transparency_log.package_specific_id.clone(),
         };
         let num_artifacts = match self.pending_info.get_mut(&package) {
@@ -143,14 +145,18 @@ impl VerificationService {
 
         if num_artifacts == transparency_log.num_artifacts {
             let package = Package {
-                package_type: transparency_log.package_type,
+                package_type: transparency_log
+                    .package_type
+                    .expect("Package type should not be empty"),
                 package_specific_id: transparency_log.package_specific_id.clone(),
             };
             if let Some(verification_artifacts) = self.pending_info.remove(&package) {
                 let build_id = self
                     .build_event_client
                     .verify_build(
-                        transparency_log.package_type,
+                        transparency_log
+                            .package_type
+                            .expect("Package type should not be empty"),
                         transparency_log.package_specific_id.clone(),
                         transparency_log.package_specific_artifact_id.clone(),
                         transparency_log.artifact_hash.clone(),
@@ -176,9 +182,12 @@ impl VerificationService {
         if let Some(verification_artifacts) = self.verifying_info.remove(build_id) {
             let verification_error = VerificationError::from(build_error);
             for verification_artifact in verification_artifacts {
-                let _ = verification_artifact
+                verification_artifact
                     .sender
-                    .send(Err(verification_error.clone()));
+                    .send(Err(verification_error.clone()))
+                    .unwrap_or_else(|e| {
+                        error!("Verification Artifact verification_error send. Verification error {:#?}", e);
+                    });
             }
         }
     }
@@ -191,7 +200,7 @@ impl VerificationService {
         let package_specific_id = build_result.package_specific_id.as_str();
 
         info!(
-            "Build with ID {} completed successfully for package type {} and package specific ID {}",
+            "Build with ID {} completed successfully for package type {:?} and package specific ID {}",
             build_id, build_result.package_type, package_specific_id
         );
 
@@ -204,26 +213,37 @@ impl VerificationService {
                         if verification_artifact.artifact_hash
                             == build_result_artifact.artifact_hash
                         {
-                            let _ = verification_artifact.sender.send(Ok(()));
+                            verification_artifact
+                                .sender
+                                .send(Ok(()))
+                                .unwrap_or_else(|_e| {
+                                    error!("Verification Artifact Hash match send Ok.");
+                                });
                         } else {
-                            let _ = verification_artifact.sender.send(Err(
-                                VerificationError::NonMatchingHash {
+                            verification_artifact
+                                .sender
+                                .send(Err(VerificationError::NonMatchingHash {
                                     build_id: build_id.to_owned(),
                                     artifact_specific_id: verification_artifact
                                         .artifact_specific_id,
                                     expected_hash: verification_artifact.artifact_hash,
                                     hash_from_build: build_result_artifact.artifact_hash.clone(),
-                                },
-                            ));
+                                }))
+                                .unwrap_or_else(|e| {
+                                    error!("Verification Artifact Hash not matched send VerificationError {:#?}", e);
+                                });
                         }
                     }
                     None => {
-                        let _ = verification_artifact.sender.send(Err(
-                            VerificationError::ArtifactNotFound {
+                        verification_artifact
+                            .sender
+                            .send(Err(VerificationError::ArtifactNotFound {
                                 build_id: build_id.to_owned(),
                                 artifact_specific_id: verification_artifact.artifact_specific_id,
-                            },
-                        ));
+                            }))
+                            .unwrap_or_else(|e| {
+                                error!("build_result_artifact:None. VerificationError {:#?}", e);
+                            });
                     }
                 }
             }
@@ -234,41 +254,68 @@ impl VerificationService {
 }
 
 #[cfg(test)]
+#[cfg(not(tarpaulin_include))]
 mod tests {
     use super::*;
     use crate::artifact_service::model::PackageType;
+    use crate::blockchain_service::service::BlockchainService;
     use crate::build_service::event::BuildEvent;
     use crate::build_service::model::BuildResultArtifact;
+    use crate::network::client::Client;
     use crate::transparency_log::log::{AddArtifactRequest, TransparencyLogService};
     use crate::util::test_util;
-    use std::path::PathBuf;
-    use tokio::sync::mpsc;
+    use libp2p::identity::Keypair;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use tokio::sync::{mpsc, Mutex};
+
+    fn create_p2p_client(local_keypair: &Keypair) -> Client {
+        let (command_sender, _command_receiver) = mpsc::channel(1);
+        Client {
+            sender: command_sender,
+            local_peer_id: local_keypair.public().to_peer_id(),
+        }
+    }
+
+    fn create_blockchain_service(local_keypair: &Keypair, p2p_client: Client) -> BlockchainService {
+        let ed25519_keypair = match local_keypair {
+            libp2p::identity::Keypair::Ed25519(ref v) => v,
+            _ => {
+                panic!("Keypair Format Error");
+            }
+        };
+
+        BlockchainService::new(ed25519_keypair, p2p_client)
+    }
+
+    fn create_transparency_log_service<P: AsRef<Path>>(artifact_path: P) -> TransparencyLogService {
+        let local_keypair = Keypair::generate_ed25519();
+        let p2p_client = create_p2p_client(&local_keypair);
+
+        let blockchain_service = create_blockchain_service(&local_keypair, p2p_client);
+
+        TransparencyLogService::new(&artifact_path, Arc::new(Mutex::new(blockchain_service)))
+            .unwrap()
+    }
 
     #[tokio::test]
     async fn test_verify_add_artifact_transaction() {
         let tmp_dir = test_util::tests::setup();
 
-        let (sender, receiver) = oneshot::channel();
-
-        let mut transparency_log_service = TransparencyLogService::new(&tmp_dir).unwrap();
+        let mut transparency_log_service = create_transparency_log_service(&tmp_dir);
 
         let package_type = PackageType::Docker;
         let package_specific_id = "alpine:3.15.1";
-        transparency_log_service
-            .add_artifact(
-                AddArtifactRequest {
-                    package_type,
-                    package_specific_id: package_specific_id.to_owned(),
-                    num_artifacts: 1,
-                    package_specific_artifact_id: "".to_owned(),
-                    artifact_hash: uuid::Uuid::new_v4().to_string(),
-                },
-                sender,
-            )
+        let transparency_log = transparency_log_service
+            .add_artifact(AddArtifactRequest {
+                package_type,
+                package_specific_id: package_specific_id.to_owned(),
+                num_artifacts: 1,
+                package_specific_artifact_id: "".to_owned(),
+                artifact_hash: uuid::Uuid::new_v4().to_string(),
+            })
             .await
             .unwrap();
-
-        let transparency_log = receiver.await.unwrap().unwrap();
         let payload = serde_json::to_string(&transparency_log).unwrap();
 
         let (verification_result_sender, _verification_result_receiver) = oneshot::channel();
@@ -309,26 +356,20 @@ mod tests {
     async fn test_verify_add_artifact_transaction_starts_build_when_num_artifacts_reached() {
         let tmp_dir = test_util::tests::setup();
 
-        let mut transparency_log_service = TransparencyLogService::new(&tmp_dir).unwrap();
+        let mut transparency_log_service = create_transparency_log_service(&tmp_dir);
 
         let mut payloads = vec![];
         for i in 1..=3 {
-            let (sender, receiver) = oneshot::channel();
-            transparency_log_service
-                .add_artifact(
-                    AddArtifactRequest {
-                        package_type: PackageType::Docker,
-                        package_specific_id: "alpine:3.15.1".to_owned(),
-                        num_artifacts: 3,
-                        package_specific_artifact_id: format!("psaid_{}", i),
-                        artifact_hash: uuid::Uuid::new_v4().to_string(),
-                    },
-                    sender,
-                )
+            let transparency_log = transparency_log_service
+                .add_artifact(AddArtifactRequest {
+                    package_type: PackageType::Docker,
+                    package_specific_id: "alpine:3.15.1".to_owned(),
+                    num_artifacts: 3,
+                    package_specific_artifact_id: format!("psaid_{}", i),
+                    artifact_hash: uuid::Uuid::new_v4().to_string(),
+                })
                 .await
                 .unwrap();
-
-            let transparency_log = receiver.await.unwrap().unwrap();
             let payload = serde_json::to_string(&transparency_log).unwrap();
             payloads.push(payload);
         }
@@ -382,29 +423,22 @@ mod tests {
     async fn test_handle_build_result_notifies_sender() {
         let tmp_dir = test_util::tests::setup();
 
-        let (sender, receiver) = oneshot::channel();
-
-        let mut transparency_log_service = TransparencyLogService::new(&tmp_dir).unwrap();
+        let mut transparency_log_service = create_transparency_log_service(&tmp_dir);
 
         let package_type = PackageType::Docker;
         let package_specific_id = "alpine:3.15.1";
         let package_specific_artifact_id = "a/b/c.blob";
         let artifact_hash = uuid::Uuid::new_v4();
-        transparency_log_service
-            .add_artifact(
-                AddArtifactRequest {
-                    package_type,
-                    package_specific_id: package_specific_id.to_owned(),
-                    num_artifacts: 1,
-                    package_specific_artifact_id: package_specific_artifact_id.to_owned(),
-                    artifact_hash: artifact_hash.to_string(),
-                },
-                sender,
-            )
+        let transparency_log = transparency_log_service
+            .add_artifact(AddArtifactRequest {
+                package_type,
+                package_specific_id: package_specific_id.to_owned(),
+                num_artifacts: 1,
+                package_specific_artifact_id: package_specific_artifact_id.to_owned(),
+                artifact_hash: artifact_hash.to_string(),
+            })
             .await
             .unwrap();
-
-        let transparency_log = receiver.await.unwrap().unwrap();
         let payload = serde_json::to_string(&transparency_log).unwrap();
 
         let (verification_result_sender, verification_result_receiver) = oneshot::channel();
@@ -456,29 +490,22 @@ mod tests {
     async fn test_handle_build_result_with_missing_artifact_notifies_sender() {
         let tmp_dir = test_util::tests::setup();
 
-        let (sender, receiver) = oneshot::channel();
-
-        let mut transparency_log_service = TransparencyLogService::new(&tmp_dir).unwrap();
+        let mut transparency_log_service = create_transparency_log_service(&tmp_dir);
 
         let package_type = PackageType::Docker;
         let package_specific_id = "alpine:3.15.1";
         let package_specific_artifact_id = "a/b/c.blob";
         let artifact_hash = uuid::Uuid::new_v4();
-        transparency_log_service
-            .add_artifact(
-                AddArtifactRequest {
-                    package_type,
-                    package_specific_id: package_specific_id.to_owned(),
-                    num_artifacts: 1,
-                    package_specific_artifact_id: package_specific_artifact_id.to_owned(),
-                    artifact_hash: artifact_hash.to_string(),
-                },
-                sender,
-            )
+        let transparency_log = transparency_log_service
+            .add_artifact(AddArtifactRequest {
+                package_type,
+                package_specific_id: package_specific_id.to_owned(),
+                num_artifacts: 1,
+                package_specific_artifact_id: package_specific_artifact_id.to_owned(),
+                artifact_hash: artifact_hash.to_string(),
+            })
             .await
             .unwrap();
-
-        let transparency_log = receiver.await.unwrap().unwrap();
         let payload = serde_json::to_string(&transparency_log).unwrap();
 
         let (verification_result_sender, verification_result_receiver) = oneshot::channel();
@@ -538,29 +565,22 @@ mod tests {
     async fn test_handle_build_result_with_different_hash_notifies_sender() {
         let tmp_dir = test_util::tests::setup();
 
-        let (sender, receiver) = oneshot::channel();
-
-        let mut transparency_log_service = TransparencyLogService::new(&tmp_dir).unwrap();
+        let mut transparency_log_service = create_transparency_log_service(&tmp_dir);
 
         let package_type = PackageType::Docker;
         let package_specific_id = "alpine:3.15.1";
         let package_specific_artifact_id = "a/b/c.blob";
         let artifact_hash = uuid::Uuid::new_v4();
-        transparency_log_service
-            .add_artifact(
-                AddArtifactRequest {
-                    package_type,
-                    package_specific_id: package_specific_id.to_owned(),
-                    num_artifacts: 1,
-                    package_specific_artifact_id: package_specific_artifact_id.to_owned(),
-                    artifact_hash: artifact_hash.to_string(),
-                },
-                sender,
-            )
+        let transparency_log = transparency_log_service
+            .add_artifact(AddArtifactRequest {
+                package_type,
+                package_specific_id: package_specific_id.to_owned(),
+                num_artifacts: 1,
+                package_specific_artifact_id: package_specific_artifact_id.to_owned(),
+                artifact_hash: artifact_hash.to_string(),
+            })
             .await
             .unwrap();
-
-        let transparency_log = receiver.await.unwrap().unwrap();
         let payload = serde_json::to_string(&transparency_log).unwrap();
 
         let (verification_result_sender, verification_result_receiver) = oneshot::channel();
@@ -622,27 +642,20 @@ mod tests {
     async fn test_handle_failed_build_notifies_sender() {
         let tmp_dir = test_util::tests::setup();
 
-        let (sender, receiver) = oneshot::channel();
-
-        let mut transparency_log_service = TransparencyLogService::new(&tmp_dir).unwrap();
+        let mut transparency_log_service = create_transparency_log_service(&tmp_dir);
 
         let package_type = PackageType::Docker;
         let package_specific_id = "alpine:3.15.1";
-        transparency_log_service
-            .add_artifact(
-                AddArtifactRequest {
-                    package_type,
-                    package_specific_id: package_specific_id.to_owned(),
-                    num_artifacts: 1,
-                    package_specific_artifact_id: "".to_owned(),
-                    artifact_hash: uuid::Uuid::new_v4().to_string(),
-                },
-                sender,
-            )
+        let transparency_log = transparency_log_service
+            .add_artifact(AddArtifactRequest {
+                package_type,
+                package_specific_id: package_specific_id.to_owned(),
+                num_artifacts: 1,
+                package_specific_artifact_id: "".to_owned(),
+                artifact_hash: uuid::Uuid::new_v4().to_string(),
+            })
             .await
             .unwrap();
-
-        let transparency_log = receiver.await.unwrap().unwrap();
         let payload = serde_json::to_string(&transparency_log).unwrap();
 
         let (verification_result_sender, verification_result_receiver) = oneshot::channel();

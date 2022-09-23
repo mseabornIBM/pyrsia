@@ -21,8 +21,7 @@ use crate::build_service::model::{BuildResult, BuildTrigger};
 use crate::build_service::service::BuildService;
 use crate::verification_service::service::VerificationService;
 use log::{debug, error, warn};
-use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug)]
 pub enum BuildEvent {
@@ -70,14 +69,16 @@ impl BuildEventClient {
         package_specific_id: String,
     ) -> Result<String, BuildError> {
         let (sender, receiver) = oneshot::channel();
-        let _ = self
-            .build_event_sender
+        self.build_event_sender
             .send(BuildEvent::Start {
                 package_type,
                 package_specific_id,
                 sender,
             })
-            .await;
+            .await
+            .unwrap_or_else(|e| {
+                error!("Error build_event_sender. {:#?}", e);
+            });
         receiver
             .await
             .map_err(|e| BuildError::InitializationFailed(e.to_string()))?
@@ -91,14 +92,16 @@ impl BuildEventClient {
         _artifact_hash: String,
     ) -> Result<String, BuildError> {
         let (sender, receiver) = oneshot::channel();
-        let _ = self
-            .build_event_sender
+        self.build_event_sender
             .send(BuildEvent::Verify {
                 package_type,
                 package_specific_id,
                 sender,
             })
-            .await;
+            .await
+            .unwrap_or_else(|e| {
+                error!("Error build_event_sender. {:#?}", e);
+            });
         receiver
             .await
             .map_err(|e| BuildError::InitializationFailed(e.to_string()))?
@@ -112,8 +115,7 @@ impl BuildEventClient {
         build_trigger: BuildTrigger,
         artifact_urls: Vec<String>,
     ) {
-        let _ = self
-            .build_event_sender
+        self.build_event_sender
             .send(BuildEvent::Succeeded {
                 build_id: build_id.to_owned(),
                 package_type,
@@ -121,17 +123,22 @@ impl BuildEventClient {
                 build_trigger,
                 artifact_urls,
             })
-            .await;
+            .await
+            .unwrap_or_else(|e| {
+                error!("Error build_event_sender. {:#?}", e);
+            });
     }
 
     pub async fn build_failed(&self, build_id: &str, build_error: BuildError) {
-        let _ = self
-            .build_event_sender
+        self.build_event_sender
             .send(BuildEvent::Failed {
                 build_id: build_id.to_owned(),
                 build_error,
             })
-            .await;
+            .await
+            .unwrap_or_else(|e| {
+                error!("Error build_event_sender. {:#?}", e);
+            });
     }
 
     pub async fn build_result(
@@ -140,29 +147,31 @@ impl BuildEventClient {
         build_trigger: BuildTrigger,
         build_result: BuildResult,
     ) {
-        let _ = self
-            .build_event_sender
+        self.build_event_sender
             .send(BuildEvent::Result {
                 build_id: build_id.to_owned(),
                 build_trigger,
                 build_result,
             })
-            .await;
+            .await
+            .unwrap_or_else(|e| {
+                error!("Error build_event_sender. {:#?}", e);
+            });
     }
 }
 
 pub struct BuildEventLoop {
-    artifact_service: Arc<Mutex<ArtifactService>>,
-    build_service: Arc<Mutex<BuildService>>,
-    verification_service: Arc<Mutex<VerificationService>>,
+    artifact_service: ArtifactService,
+    build_service: BuildService,
+    verification_service: VerificationService,
     build_event_receiver: mpsc::Receiver<BuildEvent>,
 }
 
 impl BuildEventLoop {
     pub fn new(
-        artifact_service: Arc<Mutex<ArtifactService>>,
-        build_service: Arc<Mutex<BuildService>>,
-        verification_service: Arc<Mutex<VerificationService>>,
+        artifact_service: ArtifactService,
+        build_service: BuildService,
+        verification_service: VerificationService,
         build_event_receiver: mpsc::Receiver<BuildEvent>,
     ) -> Self {
         Self {
@@ -175,21 +184,19 @@ impl BuildEventLoop {
 
     pub async fn run(mut self) {
         loop {
-            tokio::select! {
-                next_build_event = self.build_event_receiver.recv() => match next_build_event {
-                    Some(build_event) => {
-                        self.handle_build_event(build_event).await;
-                    },
-                    None => {
-                        warn!("Got empty build event");
-                        return;
-                    }
+            match self.build_event_receiver.recv().await {
+                Some(build_event) => {
+                    self.handle_build_event(build_event).await;
+                }
+                None => {
+                    warn!("Got empty build event");
+                    return;
                 }
             }
         }
     }
 
-    async fn handle_build_event(&self, build_event: BuildEvent) {
+    async fn handle_build_event(&mut self, build_event: BuildEvent) {
         debug!("Handle BuildEvent: {:?}", build_event);
         match build_event {
             BuildEvent::Start {
@@ -199,11 +206,11 @@ impl BuildEventLoop {
             } => {
                 let result = self
                     .build_service
-                    .lock()
-                    .await
                     .start_build(package_type, package_specific_id, BuildTrigger::FromSource)
                     .await;
-                let _ = sender.send(result);
+                sender.send(result).unwrap_or_else(|e| {
+                    error!("build error. {:#?}", e);
+                });
             }
             BuildEvent::Verify {
                 package_type,
@@ -212,15 +219,15 @@ impl BuildEventLoop {
             } => {
                 let result = self
                     .build_service
-                    .lock()
-                    .await
                     .start_build(
                         package_type,
                         package_specific_id,
                         BuildTrigger::Verification,
                     )
                     .await;
-                let _ = sender.send(result);
+                sender.send(result).unwrap_or_else(|e| {
+                    error!("build error. {:#?}", e);
+                });
             }
             BuildEvent::Failed {
                 build_id,
@@ -229,8 +236,6 @@ impl BuildEventLoop {
                 error!("{}", build_error.to_string());
 
                 self.verification_service
-                    .lock()
-                    .await
                     .handle_build_failed(&build_id, build_error);
             }
             BuildEvent::Succeeded {
@@ -241,8 +246,6 @@ impl BuildEventLoop {
                 artifact_urls,
             } => {
                 self.build_service
-                    .lock()
-                    .await
                     .handle_successful_build(
                         &build_id,
                         package_type,
@@ -260,15 +263,11 @@ impl BuildEventLoop {
                 if let Err(error) = match build_trigger {
                     BuildTrigger::FromSource => {
                         self.artifact_service
-                            .lock()
-                            .await
                             .handle_build_result(&build_id, build_result)
                             .await
                     }
                     BuildTrigger::Verification => {
                         self.verification_service
-                            .lock()
-                            .await
                             .handle_build_result(&build_id, build_result)
                             .await
                     }
@@ -279,7 +278,7 @@ impl BuildEventLoop {
                     )
                 }
 
-                self.build_service.lock().await.clean_up_build(&build_id);
+                self.build_service.clean_up_build(&build_id);
             }
         }
     }

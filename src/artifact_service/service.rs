@@ -31,11 +31,11 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
 use std::str;
-use tokio::sync::oneshot;
 
 /// The artifact service is the component that handles everything related to
 /// pyrsia artifacts. It allows artifacts to be retrieved and added to the
 /// pyrsia network by requesting a build from source.
+#[derive(Clone)]
 pub struct ArtifactService {
     pub artifact_storage: ArtifactStorage,
     build_event_client: BuildEventClient,
@@ -46,11 +46,11 @@ pub struct ArtifactService {
 impl ArtifactService {
     pub fn new<P: AsRef<Path>>(
         artifact_path: P,
+        transparency_log_service: TransparencyLogService,
         build_event_client: BuildEventClient,
         p2p_client: Client,
     ) -> anyhow::Result<Self> {
         let artifact_storage = ArtifactStorage::new(&artifact_path)?;
-        let transparency_log_service = TransparencyLogService::new(&artifact_path)?;
         Ok(ArtifactService {
             artifact_storage,
             build_event_client,
@@ -77,7 +77,7 @@ impl ArtifactService {
         let package_specific_id = build_result.package_specific_id.as_str();
 
         info!(
-            "Build with ID {} completed successfully for package type {} and package specific ID {}",
+            "Build with ID {} completed successfully for package type {:?} and package specific ID {}",
             build_id, build_result.package_type, package_specific_id
         );
 
@@ -95,17 +95,17 @@ impl ArtifactService {
                 add_artifact_request
             );
 
-            let (tp_log_sender, tp_log_receiver) = oneshot::channel();
+            let add_artifact_transparency_log = self
+                .transparency_log_service
+                .add_artifact(add_artifact_request)
+                .await?;
+            info!(
+                "Transparency Log for build with ID {} successfully created.",
+                build_id
+            );
 
             self.transparency_log_service
-                .add_artifact(add_artifact_request, tp_log_sender)
-                .await?;
-
-            let add_artifact_transparency_log = tp_log_receiver.await??;
-            info!(
-                "Transparency Log for build with ID {} successfully added. Adding artifact locally: {:?}",
-                build_id, add_artifact_transparency_log
-            );
+                .write_transparency_log(&add_artifact_transparency_log)?;
 
             self.put_artifact_from_build_result(
                 &artifact.artifact_location,
@@ -116,6 +116,19 @@ impl ArtifactService {
             self.p2p_client
                 .provide(&add_artifact_transparency_log.artifact_id)
                 .await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn handle_block_added(
+        &mut self,
+        payloads: Vec<Vec<u8>>,
+    ) -> Result<(), anyhow::Error> {
+        if payloads.len() == 1 {
+            let transparency_log: TransparencyLog = serde_json::from_slice(&payloads[0])?;
+            self.transparency_log_service
+                .write_transparency_log(&transparency_log)?;
         }
 
         Ok(())
@@ -179,6 +192,19 @@ impl ArtifactService {
         Ok(blob_content)
     }
 
+    /// Retrieve the artifact logs for the specified package.
+    pub async fn get_logs_for_artifact(
+        &mut self,
+        package_type: PackageType,
+        package_specific_id: &str,
+    ) -> anyhow::Result<Vec<TransparencyLog>> {
+        let transparency_logs = self
+            .transparency_log_service
+            .search_transparency_logs(&package_type, package_specific_id)?;
+
+        Ok(transparency_logs)
+    }
+
     async fn get_artifact_from_peers(
         &mut self,
         artifact_id: &str,
@@ -234,20 +260,22 @@ impl ArtifactService {
 }
 
 #[cfg(test)]
+#[cfg(not(tarpaulin_include))]
 mod tests {
     use super::*;
+    use crate::blockchain_service::service::BlockchainService;
+    use crate::build_service::event::BuildEvent;
     use crate::network::client::command::Command;
     use crate::network::idle_metric_protocol::PeerMetrics;
-    use crate::transparency_log::log::{AddArtifactRequest, TransparencyLogError};
     use crate::util::test_util;
-    use anyhow::Context;
-    use libp2p::identity::Keypair;
+    use libp2p::identity::ed25519::Keypair;
+    use libp2p::identity::PublicKey;
     use sha2::{Digest, Sha256};
     use std::collections::HashSet;
     use std::env;
-    use std::fs::File;
     use std::path::PathBuf;
-    use tokio::sync::{mpsc, oneshot};
+    use std::sync::Arc;
+    use tokio::sync::{mpsc, Mutex};
     use tokio::task;
 
     const VALID_ARTIFACT_HASH: [u8; 32] = [
@@ -256,41 +284,83 @@ mod tests {
         0x4f,
     ];
 
+    fn create_p2p_client(keypair: &Keypair) -> (mpsc::Receiver<Command>, Client) {
+        let (command_sender, command_receiver) = mpsc::channel(1);
+        let p2p_client = Client {
+            sender: command_sender,
+            local_peer_id: PublicKey::Ed25519(keypair.public()).to_peer_id(),
+        };
+
+        (command_receiver, p2p_client)
+    }
+
+    fn create_artifact_service<P: AsRef<Path>>(
+        artifact_path: P,
+        keypair: &Keypair,
+        p2p_client: Client,
+    ) -> (mpsc::Receiver<BuildEvent>, ArtifactService) {
+        let blockchain_service = Arc::new(Mutex::new(BlockchainService::new(
+            keypair,
+            p2p_client.clone(),
+        )));
+
+        let transparency_log_service =
+            TransparencyLogService::new(&artifact_path, blockchain_service)
+                .expect("Creating TransparencyLogService failed");
+
+        let (build_event_sender, build_event_receiver) = mpsc::channel(1);
+        let build_event_client = BuildEventClient::new(build_event_sender);
+
+        let artifact_service = ArtifactService::new(
+            &artifact_path,
+            transparency_log_service,
+            build_event_client,
+            p2p_client,
+        )
+        .expect("Creating ArtifactService failed");
+
+        (build_event_receiver, artifact_service)
+    }
+
     #[tokio::test]
     async fn test_put_and_get_artifact() {
         let tmp_dir = test_util::tests::setup();
 
-        let (add_artifact_sender, add_artifact_receiver) = oneshot::channel();
-        let (command_sender, _command_receiver) = mpsc::channel(1);
-        let p2p_client = Client {
-            sender: command_sender,
-            local_peer_id: Keypair::generate_ed25519().public().to_peer_id(),
-        };
+        let keypair = Keypair::generate();
 
-        let (build_event_sender, _build_event_receiver) = mpsc::channel(1);
-        let build_event_client = BuildEventClient::new(build_event_sender);
-        let mut artifact_service =
-            ArtifactService::new(&tmp_dir, build_event_client, p2p_client).unwrap();
+        let (mut command_receiver, p2p_client) = create_p2p_client(&keypair);
+        let (_build_event_receiver, mut artifact_service) =
+            create_artifact_service(&tmp_dir, &keypair, p2p_client.clone());
+
+        tokio::spawn(async move {
+            loop {
+                match command_receiver.recv().await {
+                    Some(Command::ListPeers { sender, .. }) => {
+                        let _ = sender.send(HashSet::new());
+                    }
+                    _ => panic!("Command must match Command::ListPeers"),
+                }
+            }
+        });
 
         let package_type = PackageType::Docker;
         let package_specific_id = "package_specific_id";
         let package_specific_artifact_id = "package_specific_artifact_id";
-        artifact_service
+        let transparency_log = artifact_service
             .transparency_log_service
-            .add_artifact(
-                AddArtifactRequest {
-                    package_type,
-                    package_specific_id: package_specific_id.to_owned(),
-                    num_artifacts: 8,
-                    package_specific_artifact_id: package_specific_artifact_id.to_owned(),
-                    artifact_hash: hex::encode(VALID_ARTIFACT_HASH),
-                },
-                add_artifact_sender,
-            )
+            .add_artifact(AddArtifactRequest {
+                package_type,
+                package_specific_id: package_specific_id.to_owned(),
+                num_artifacts: 8,
+                package_specific_artifact_id: package_specific_artifact_id.to_owned(),
+                artifact_hash: hex::encode(VALID_ARTIFACT_HASH),
+            })
             .await
             .unwrap();
-
-        let transparency_log = add_artifact_receiver.await.unwrap().unwrap();
+        artifact_service
+            .transparency_log_service
+            .write_transparency_log(&transparency_log)
+            .unwrap();
 
         //put the artifact
         artifact_service
@@ -327,20 +397,21 @@ mod tests {
     async fn test_get_from_peers() {
         let tmp_dir = test_util::tests::setup();
 
-        let (add_artifact_sender, add_artifact_receiver) = oneshot::channel();
-        let (sender, mut receiver) = mpsc::channel(1);
-        let local_peer_id = Keypair::generate_ed25519().public().to_peer_id();
-        let p2p_client = Client {
-            sender,
-            local_peer_id,
-        };
+        let keypair = Keypair::generate();
+
+        let (mut command_receiver, p2p_client) = create_p2p_client(&keypair);
+        let (_build_event_receiver, mut artifact_service) =
+            create_artifact_service(&tmp_dir, &keypair, p2p_client.clone());
 
         tokio::spawn(async move {
             loop {
-                match receiver.recv().await {
+                match command_receiver.recv().await {
+                    Some(Command::ListPeers { sender, .. }) => {
+                        let _ = sender.send(HashSet::new());
+                    },
                     Some(Command::ListProviders { sender, .. }) => {
                         let mut set = HashSet::new();
-                        set.insert(local_peer_id);
+                        set.insert(p2p_client.local_peer_id);
                         let _ = sender.send(set);
                     },
                     Some(Command::RequestIdleMetric { sender, .. }) => {
@@ -351,15 +422,10 @@ mod tests {
                     Some(Command::RequestArtifact { sender, .. }) => {
                         let _ = sender.send(Ok(b"SAMPLE_DATA".to_vec()));
                     },
-                    _ => panic!("Command must match Command::ListProviders, Command::RequestIdleMetric, Command::RequestArtifact"),
+                    _ => panic!("Command must match Command::ListPeers, Command::ListProviders, Command::RequestIdleMetric, Command::RequestArtifact"),
                 }
             }
         });
-
-        let (build_event_sender, _build_event_receiver) = mpsc::channel(1);
-        let build_event_client = BuildEventClient::new(build_event_sender);
-        let mut artifact_service =
-            ArtifactService::new(&tmp_dir, build_event_client, p2p_client).unwrap();
 
         let mut hasher = Sha256::new();
         hasher.update(b"SAMPLE_DATA");
@@ -368,22 +434,21 @@ mod tests {
         let package_type = PackageType::Docker;
         let package_specific_id = "package_specific_id";
         let package_specific_artifact_id = "package_specific_artifact_id";
-        artifact_service
+        let transparency_log = artifact_service
             .transparency_log_service
-            .add_artifact(
-                AddArtifactRequest {
-                    package_type,
-                    package_specific_id: package_specific_id.to_owned(),
-                    num_artifacts: 8,
-                    package_specific_artifact_id: package_specific_artifact_id.to_owned(),
-                    artifact_hash: random_hash.clone(),
-                },
-                add_artifact_sender,
-            )
+            .add_artifact(AddArtifactRequest {
+                package_type,
+                package_specific_id: package_specific_id.to_owned(),
+                num_artifacts: 8,
+                package_specific_artifact_id: package_specific_artifact_id.to_owned(),
+                artifact_hash: random_hash.clone(),
+            })
             .await
             .unwrap();
-
-        add_artifact_receiver.await.unwrap().unwrap();
+        artifact_service
+            .transparency_log_service
+            .write_transparency_log(&transparency_log)
+            .unwrap();
 
         let future = {
             artifact_service
@@ -400,21 +465,15 @@ mod tests {
     async fn test_get_from_peers_with_no_providers() {
         let tmp_dir = test_util::tests::setup();
 
-        let (sender, mut receiver) = mpsc::channel(1);
-        let peer_id = Keypair::generate_ed25519().public().to_peer_id();
-        let p2p_client = Client {
-            sender,
-            local_peer_id: peer_id,
-        };
+        let keypair = Keypair::generate();
 
-        let (build_event_sender, _build_event_receiver) = mpsc::channel(1);
-        let build_event_client = BuildEventClient::new(build_event_sender);
-        let mut artifact_service =
-            ArtifactService::new(&tmp_dir, build_event_client, p2p_client).unwrap();
+        let (mut command_receiver, p2p_client) = create_p2p_client(&keypair);
+        let (_build_event_receiver, mut artifact_service) =
+            create_artifact_service(&tmp_dir, &keypair, p2p_client.clone());
 
         tokio::spawn(async move {
             tokio::select! {
-                command = receiver.recv() => {
+                command = command_receiver.recv() => {
                     match command {
                         Some(Command::ListProviders { sender, .. }) => {
                             let _ = sender.send(Default::default());
@@ -441,18 +500,22 @@ mod tests {
     async fn test_verify_artifact_succeeds_when_hashes_same() {
         let tmp_dir = test_util::tests::setup();
 
-        let (add_artifact_sender, _receiver) = oneshot::channel();
-        let (sender, _receiver) = mpsc::channel(1);
-        let local_peer_id = Keypair::generate_ed25519().public().to_peer_id();
-        let p2p_client = Client {
-            sender,
-            local_peer_id,
-        };
+        let keypair = Keypair::generate();
 
-        let (build_event_sender, _build_event_receiver) = mpsc::channel(1);
-        let build_event_client = BuildEventClient::new(build_event_sender);
-        let mut artifact_service =
-            ArtifactService::new(&tmp_dir, build_event_client, p2p_client).unwrap();
+        let (mut command_receiver, p2p_client) = create_p2p_client(&keypair);
+        let (_build_event_receiver, mut artifact_service) =
+            create_artifact_service(&tmp_dir, &keypair, p2p_client.clone());
+
+        tokio::spawn(async move {
+            loop {
+                match command_receiver.recv().await {
+                    Some(Command::ListPeers { sender, .. }) => {
+                        let _ = sender.send(HashSet::new());
+                    }
+                    _ => panic!("Command must match Command::ListPeers"),
+                }
+            }
+        });
 
         let mut hasher1 = Sha256::new();
         hasher1.update(b"SAMPLE_DATA");
@@ -461,19 +524,20 @@ mod tests {
         let package_type = PackageType::Docker;
         let package_specific_id = "package_specific_id";
         let package_specific_artifact_id = "package_specific_artifact_id";
+        let created_transparency_log = artifact_service
+            .transparency_log_service
+            .add_artifact(AddArtifactRequest {
+                package_type,
+                package_specific_id: package_specific_id.to_owned(),
+                num_artifacts: 8,
+                package_specific_artifact_id: package_specific_artifact_id.to_owned(),
+                artifact_hash: random_hash,
+            })
+            .await
+            .unwrap();
         artifact_service
             .transparency_log_service
-            .add_artifact(
-                AddArtifactRequest {
-                    package_type,
-                    package_specific_id: package_specific_id.to_owned(),
-                    num_artifacts: 8,
-                    package_specific_artifact_id: package_specific_artifact_id.to_owned(),
-                    artifact_hash: random_hash,
-                },
-                add_artifact_sender,
-            )
-            .await
+            .write_transparency_log(&created_transparency_log)
             .unwrap();
 
         let transparency_log = artifact_service
@@ -493,18 +557,22 @@ mod tests {
     async fn test_verify_artifact_fails_when_hashes_differ() {
         let tmp_dir = test_util::tests::setup();
 
-        let (add_artifact_sender, _receiver) = oneshot::channel();
-        let (sender, _receiver) = mpsc::channel(1);
-        let local_peer_id = Keypair::generate_ed25519().public().to_peer_id();
-        let p2p_client = Client {
-            sender,
-            local_peer_id,
-        };
+        let keypair = Keypair::generate();
 
-        let (build_event_sender, _build_event_receiver) = mpsc::channel(1);
-        let build_event_client = BuildEventClient::new(build_event_sender);
-        let mut artifact_service =
-            ArtifactService::new(&tmp_dir, build_event_client, p2p_client).unwrap();
+        let (mut command_receiver, p2p_client) = create_p2p_client(&keypair);
+        let (_build_event_receiver, mut artifact_service) =
+            create_artifact_service(&tmp_dir, &keypair, p2p_client.clone());
+
+        tokio::spawn(async move {
+            loop {
+                match command_receiver.recv().await {
+                    Some(Command::ListPeers { sender, .. }) => {
+                        let _ = sender.send(HashSet::new());
+                    }
+                    _ => panic!("Command must match Command::ListPeers"),
+                }
+            }
+        });
 
         let mut hasher1 = Sha256::new();
         hasher1.update(b"SAMPLE_DATA");
@@ -517,19 +585,20 @@ mod tests {
         let package_type = PackageType::Docker;
         let package_specific_id = "package_specific_id";
         let package_specific_artifact_id = "package_specific_artifact_id";
+        let created_transparency_log = artifact_service
+            .transparency_log_service
+            .add_artifact(AddArtifactRequest {
+                package_type,
+                package_specific_id: package_specific_id.to_owned(),
+                num_artifacts: 8,
+                package_specific_artifact_id: package_specific_artifact_id.to_owned(),
+                artifact_hash: random_hash.clone(),
+            })
+            .await
+            .unwrap();
         artifact_service
             .transparency_log_service
-            .add_artifact(
-                AddArtifactRequest {
-                    package_type,
-                    package_specific_id: package_specific_id.to_owned(),
-                    num_artifacts: 8,
-                    package_specific_artifact_id: package_specific_artifact_id.to_owned(),
-                    artifact_hash: random_hash.clone(),
-                },
-                add_artifact_sender,
-            )
-            .await
+            .write_transparency_log(&created_transparency_log)
             .unwrap();
 
         let transparency_log = artifact_service
@@ -549,6 +618,59 @@ mod tests {
                 actual_hash: random_hash
             }
         );
+
+        test_util::tests::teardown(tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_get_artifact_logs() {
+        let tmp_dir = test_util::tests::setup();
+
+        let keypair = Keypair::generate();
+
+        let (mut command_receiver, p2p_client) = create_p2p_client(&keypair);
+        let (_build_event_receiver, mut artifact_service) =
+            create_artifact_service(&tmp_dir, &keypair, p2p_client.clone());
+
+        tokio::spawn(async move {
+            loop {
+                match command_receiver.recv().await {
+                    Some(Command::ListPeers { sender, .. }) => {
+                        let _ = sender.send(HashSet::new());
+                    }
+                    _ => panic!("Command must match Command::ListPeers"),
+                }
+            }
+        });
+
+        let hasher1 = Sha256::new();
+        let random_hash = hex::encode(hasher1.finalize());
+
+        let package_type = PackageType::Maven2;
+        let package_specific_id = "package_specific_id";
+        let package_specific_artifact_id = "package_specific_artifact_id";
+        let transparency_log = artifact_service
+            .transparency_log_service
+            .add_artifact(AddArtifactRequest {
+                package_type,
+                package_specific_id: package_specific_id.to_owned(),
+                num_artifacts: 8,
+                package_specific_artifact_id: package_specific_artifact_id.to_owned(),
+                artifact_hash: random_hash,
+            })
+            .await
+            .unwrap();
+        artifact_service
+            .transparency_log_service
+            .write_transparency_log(&transparency_log)
+            .unwrap();
+
+        let result = artifact_service
+            .transparency_log_service
+            .search_transparency_logs(&package_type, package_specific_id);
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 1);
 
         test_util::tests::teardown(tmp_dir);
     }

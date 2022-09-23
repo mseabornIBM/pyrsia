@@ -14,17 +14,23 @@
    limitations under the License.
 */
 
+use anyhow::bail;
+use bincode::deserialize;
 use libp2p::multiaddr::Protocol;
 use libp2p::request_response::ResponseChannel;
 use libp2p::{Multiaddr, PeerId};
 use log::debug;
 
 use pyrsia::artifact_service::service::ArtifactService;
+use pyrsia::blockchain_service::service::BlockchainCommand;
+use pyrsia::blockchain_service::service::BlockchainService;
 use pyrsia::network::artifact_protocol::ArtifactResponse;
+use pyrsia::network::blockchain_protocol::BlockchainResponse;
 use pyrsia::network::client::Client;
 use pyrsia::network::idle_metric_protocol::{IdleMetricResponse, PeerMetrics};
 use pyrsia::peer_metrics;
-use pyrsia_blockchain_network::blockchain::Blockchain;
+use pyrsia_blockchain_network::structures::block::Block;
+use pyrsia_blockchain_network::structures::header::Ordinal;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -39,16 +45,26 @@ pub async fn dial_other_peer(mut p2p_client: Client, to_dial: &Multiaddr) -> any
     }
 }
 
+/// AutoNAT probe another node with the specified address
+pub async fn probe_other_peer(mut p2p_client: Client, to_probe: &Multiaddr) -> anyhow::Result<()> {
+    match to_probe.iter().last() {
+        Some(Protocol::P2p(hash)) => match PeerId::from_multihash(hash) {
+            Ok(peer_id) => p2p_client.add_probe_address(&peer_id, to_probe).await,
+            Err(_) => anyhow::bail!("Invalid hash provided for Peer ID."),
+        },
+        _ => anyhow::bail!("Expect peer address to contain Peer ID."),
+    }
+}
+
 /// Respond to a RequestArtifact event by getting the artifact
 /// based on the provided artifact id.
 pub async fn handle_request_artifact(
-    artifact_service: Arc<Mutex<ArtifactService>>,
+    mut artifact_service: ArtifactService,
     artifact_id: &str,
     channel: ResponseChannel<ArtifactResponse>,
 ) -> anyhow::Result<()> {
     debug!("Handling request artifact: {:?}", artifact_id);
 
-    let mut artifact_service = artifact_service.lock().await;
     let content = artifact_service.get_artifact_locally(artifact_id).await?;
 
     artifact_service
@@ -69,17 +85,54 @@ pub async fn handle_request_idle_metric(
     p2p_client.respond_idle_metric(peer_metrics, channel).await
 }
 
-pub async fn handle_request_block_update(
-    mut p2p_client: Client,
-    blockchain: Arc<Mutex<Blockchain>>,
-    block_ordinal: u64,
-    block: Vec<u8>,
+//Respsond to the BlockchainRequest event
+pub async fn handle_request_blockchain(
+    artifact_service: ArtifactService,
+    blockchain_service: Arc<Mutex<BlockchainService>>,
+    data: Vec<u8>,
+    channel: ResponseChannel<BlockchainResponse>,
 ) -> anyhow::Result<()> {
-    debug!(
-        "Handling request blockchain: {:?}={:?}",
-        block_ordinal, block
-    );
+    debug!("Handling request blockchain: {:?}", data);
+    match BlockchainCommand::try_from(data[0])? {
+        BlockchainCommand::Broadcast => {
+            debug!("Blockchain get BlockchainCommand::Broadcast");
+            handle_broadcast_blockchain(artifact_service, blockchain_service, data, channel).await
+        }
+        _ => {
+            debug!("Blockchain get other command");
+            todo!()
+        }
+    }
+}
 
-    let _ = blockchain; // TODO!
-    p2p_client.respond_block_update().await
+pub async fn handle_broadcast_blockchain(
+    mut artifact_service: ArtifactService,
+    blockchain_service: Arc<Mutex<BlockchainService>>,
+    data: Vec<u8>,
+    channel: ResponseChannel<BlockchainResponse>,
+) -> anyhow::Result<()> {
+    debug!("Handling broadcast blockchain: {:?}", data);
+
+    if data.len() < 17 {
+        bail!("Blockcchain data is invalid")
+    } else {
+        let block_ordinal: Ordinal = deserialize(&data[1..17])?;
+        let block: Block = deserialize(&data[17..])?;
+
+        let mut blockchain_service = blockchain_service.lock().await;
+
+        let payloads = block.fetch_payload();
+        blockchain_service
+            .add_block(block_ordinal, Box::new(block))
+            .await;
+
+        artifact_service.handle_block_added(payloads).await?;
+
+        let response_data = vec![0u8];
+
+        artifact_service
+            .p2p_client
+            .respond_blockchain(response_data, channel)
+            .await
+    }
 }

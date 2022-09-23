@@ -16,9 +16,12 @@
 
 use crate::network::artifact_protocol::{ArtifactRequest, ArtifactResponse};
 use crate::network::behaviour::{PyrsiaNetworkBehaviour, PyrsiaNetworkEvent};
-use crate::network::blockchain_protocol::{BlockUpdateRequest, BlockUpdateResponse};
+use crate::network::blockchain_protocol::{BlockchainRequest, BlockchainResponse};
 use crate::network::client::command::Command;
 use crate::network::idle_metric_protocol::{IdleMetricRequest, IdleMetricResponse, PeerMetrics};
+use crate::node_api::model::cli::Status;
+use crate::util::env_util::read_var;
+use libp2p::autonat::Event as AutonatEvent;
 use libp2p::core::PeerId;
 use libp2p::futures::StreamExt;
 use libp2p::identify::IdentifyEvent;
@@ -29,7 +32,7 @@ use libp2p::request_response::{
 };
 use libp2p::swarm::SwarmEvent;
 use libp2p::Swarm;
-use log::{debug, info, trace, warn};
+use log::{debug, error, info, trace, warn};
 use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::error::Error;
 use tokio::sync::{mpsc, oneshot};
@@ -39,8 +42,7 @@ type PendingListPeersMap = HashMap<QueryId, oneshot::Sender<HashSet<PeerId>>>;
 type PendingStartProvidingMap = HashMap<QueryId, oneshot::Sender<()>>;
 type PendingRequestArtifactMap = HashMap<RequestId, oneshot::Sender<anyhow::Result<Vec<u8>>>>;
 type PendingRequestIdleMetricMap = HashMap<RequestId, oneshot::Sender<anyhow::Result<PeerMetrics>>>;
-type PendingRequestBlockUpdateMap =
-    HashMap<RequestId, oneshot::Sender<anyhow::Result<Option<u64>>>>;
+type PendingRequestBlockchainMap = HashMap<RequestId, oneshot::Sender<anyhow::Result<Vec<u8>>>>;
 
 /// The `PyrsiaEventLoop` is responsible for taking care of incoming
 /// events from the libp2p [`Swarm`] itself, the different network
@@ -56,7 +58,7 @@ pub struct PyrsiaEventLoop {
     pending_list_providers: PendingListPeersMap,
     pending_request_artifact: PendingRequestArtifactMap,
     pending_idle_metric_requests: PendingRequestIdleMetricMap,
-    pending_block_update_requests: PendingRequestBlockUpdateMap,
+    pending_blockchain_requests: PendingRequestBlockchainMap,
 }
 
 impl PyrsiaEventLoop {
@@ -75,7 +77,7 @@ impl PyrsiaEventLoop {
             pending_list_providers: Default::default(),
             pending_request_artifact: Default::default(),
             pending_idle_metric_requests: Default::default(),
-            pending_block_update_requests: Default::default(),
+            pending_blockchain_requests: Default::default(),
         }
     }
 
@@ -85,11 +87,12 @@ impl PyrsiaEventLoop {
         loop {
             tokio::select! {
                 event = self.swarm.select_next_some() => match event {
+                    SwarmEvent::Behaviour(PyrsiaNetworkEvent::AutoNat(autonat_event)) => self.handle_autonat_event(autonat_event).await,
                     SwarmEvent::Behaviour(PyrsiaNetworkEvent::Identify(identify_event)) => self.handle_identify_event(identify_event).await,
                     SwarmEvent::Behaviour(PyrsiaNetworkEvent::Kademlia(kademlia_event)) => self.handle_kademlia_event(kademlia_event).await,
                     SwarmEvent::Behaviour(PyrsiaNetworkEvent::RequestResponse(request_response_event)) => self.handle_request_response_event(request_response_event).await,
                     SwarmEvent::Behaviour(PyrsiaNetworkEvent::IdleMetricRequestResponse(request_response_event)) => self.handle_idle_metric_request_response_event(request_response_event).await,
-                    SwarmEvent::Behaviour(PyrsiaNetworkEvent::BlockUpdateRequestResponse(request_response_event)) => self.handle_block_update_request_response_event(request_response_event).await,
+                    SwarmEvent::Behaviour(PyrsiaNetworkEvent::BlockchainRequestResponse(request_response_event)) => self.handle_blockchain_request_response_event(request_response_event).await,
                     swarm_event => self.handle_swarm_event(swarm_event).await,
                 },
                 command = self.command_receiver.recv() => match command {
@@ -99,6 +102,25 @@ impl PyrsiaEventLoop {
                     // Command channel closed, thus shutting down the network event loop.
                     None => { warn!("Got empty command"); return },
                 },
+            }
+        }
+    }
+
+    // Handles events from the `AutoNat` network behaviour.
+    async fn handle_autonat_event(&mut self, event: AutonatEvent) {
+        trace!("Handle AutonatEvent: {:?}", event);
+        match event {
+            AutonatEvent::InboundProbe(evt) => {
+                debug!("AutonatEvent::InboundProbe {:?}", evt);
+                // let peer = evt.Request.ge
+                // let address = evt.get_address();
+                // self.swarm.behaviour_mut().auto_nat.add_server(peer, address);
+            }
+            AutonatEvent::OutboundProbe(evt) => {
+                debug!("AutonatEvent::OutboundProbe {:?}", evt);
+            }
+            AutonatEvent::StatusChanged { old, new } => {
+                info!("State changed from {:?} to {:?}", old, new);
             }
         }
     }
@@ -130,17 +152,23 @@ impl PyrsiaEventLoop {
     // Handles events from the `Kademlia` network behaviour.
     async fn handle_kademlia_event(&mut self, event: KademliaEvent) {
         trace!("Handle KademliaEvent: {:?}", event);
+        let event_str = format!("{:#?}", event);
         match event {
             KademliaEvent::OutboundQueryCompleted {
                 id,
                 result: QueryResult::GetClosestPeers(Ok(GetClosestPeersOk { key: _key, peers })),
                 ..
             } => {
-                let _ = self
-                    .pending_list_peers
+                self.pending_list_peers
                     .remove(&id)
                     .expect("Completed query to be previously pending.")
-                    .send(HashSet::from_iter(peers));
+                    .send(HashSet::from_iter(peers))
+                    .unwrap_or_else(|e| {
+                        error!(
+                            "Handle KademliaEvent match arm: {}. Peers: {:?}",
+                            event_str, e
+                        );
+                    });
             }
             KademliaEvent::OutboundQueryCompleted {
                 id,
@@ -151,7 +179,10 @@ impl PyrsiaEventLoop {
                     .pending_start_providing
                     .remove(&id)
                     .expect("Completed query to be previously pending.");
-                let _ = sender.send(());
+
+                sender.send(()).unwrap_or_else(|_e| {
+                    error!("Handle KademliaEvent match arm: {}.", event_str);
+                });
             }
             KademliaEvent::OutboundQueryCompleted {
                 id,
@@ -163,11 +194,16 @@ impl PyrsiaEventLoop {
                     })),
                 ..
             } => {
-                let _ = self
-                    .pending_list_providers
+                self.pending_list_providers
                     .remove(&id)
                     .expect("Completed query to be previously pending.")
-                    .send(providers);
+                    .send(providers)
+                    .unwrap_or_else(|e| {
+                        error!(
+                            "Handle KademliaEvent match arm: {}. Providers: {:?}",
+                            event_str, e
+                        );
+                    });
             }
             _ => {}
         }
@@ -180,6 +216,7 @@ impl PyrsiaEventLoop {
         event: RequestResponseEvent<ArtifactRequest, ArtifactResponse>,
     ) {
         trace!("Handle RequestResponseEvent: {:?}", event);
+        let event_str = format!("{:#?}", event);
         match event {
             RequestResponseEvent::Message { message, .. } => match message {
                 RequestResponseMessage::Request {
@@ -197,22 +234,29 @@ impl PyrsiaEventLoop {
                     request_id,
                     response,
                 } => {
-                    let _ = self
-                        .pending_request_artifact
+                    self.pending_request_artifact
                         .remove(&request_id)
                         .expect("Request to still be pending.")
-                        .send(Ok(response.0));
+                        .send(Ok(response.0))
+                        .unwrap_or_else(|e| {
+                            error!(
+                                "Handle RequestResponseEvent match arm: {}. Error: {:?}",
+                                event_str, e
+                            );
+                        });
                 }
             },
             RequestResponseEvent::InboundFailure { .. } => {}
             RequestResponseEvent::OutboundFailure {
                 request_id, error, ..
             } => {
-                let _ = self
-                    .pending_request_artifact
+                self.pending_request_artifact
                     .remove(&request_id)
                     .expect("Request to still be pending.")
-                    .send(Err(error.into()));
+                    .send(Err(error.into()))
+                    .unwrap_or_else(|e| {
+                        error!("Handle RequestResponseEvent match arm: {}. pending_request_artifact: {:?}", event_str, e);
+                    });
             }
             RequestResponseEvent::ResponseSent { .. } => {}
         }
@@ -225,6 +269,7 @@ impl PyrsiaEventLoop {
         event: RequestResponseEvent<IdleMetricRequest, IdleMetricResponse>,
     ) {
         trace!("Handle RequestResponseEvent: {:?}", event);
+        let event_str = format!("{:#?}", event);
         match event {
             RequestResponseEvent::Message { message, .. } => match message {
                 RequestResponseMessage::Request { channel, .. } => {
@@ -237,67 +282,76 @@ impl PyrsiaEventLoop {
                     request_id,
                     response,
                 } => {
-                    let _ = self
-                        .pending_idle_metric_requests
+                    self.pending_idle_metric_requests
                         .remove(&request_id)
                         .expect("Request to still be pending.")
-                        .send(Ok(response.0));
+                        .send(Ok(response.0))
+                        .unwrap_or_else(|e| {
+                            error!("Handle RequestResponseEvent match arm: {}. pending_idle_metric_requests: {:?}", event_str, e);
+                        });
                 }
             },
             RequestResponseEvent::InboundFailure { .. } => {}
             RequestResponseEvent::OutboundFailure {
                 request_id, error, ..
             } => {
-                let _ = self
-                    .pending_idle_metric_requests
+                self.pending_idle_metric_requests
                     .remove(&request_id)
                     .expect("Request to still be pending.")
-                    .send(Err(error.into()));
+                    .send(Err(error.into()))
+                    .unwrap_or_else(|e| {
+                        error!("Handle RequestResponseEvent match arm: {}. pending_idle_metric_requests: {:?}", event_str, e);
+                    });
             }
             RequestResponseEvent::ResponseSent { .. } => {}
         }
     }
 
     // Handles events from the `RequestResponse` for blockchain update exchange network behaviour.
-    async fn handle_block_update_request_response_event(
+    async fn handle_blockchain_request_response_event(
         &mut self,
-        event: RequestResponseEvent<BlockUpdateRequest, BlockUpdateResponse>,
+        event: RequestResponseEvent<BlockchainRequest, BlockchainResponse>,
     ) {
         trace!("Handle RequestResponseEvent: {:?}", event);
+        let event_str = format!("{:#?}", event);
         match event {
             RequestResponseEvent::Message { message, .. } => match message {
                 RequestResponseMessage::Request {
-                    request,
-                    channel: _,
-                    ..
+                    request, channel, ..
                 } => {
                     self.event_sender
-                        .send(PyrsiaEvent::BlockUpdateRequest {
-                            block_ordinal: request.0,
-                            block: request.1,
+                        .send(PyrsiaEvent::BlockchainRequest {
+                            data: request.0,
+                            channel,
                         })
                         .await
                         .expect("Event receiver not to be dropped.");
                 }
                 RequestResponseMessage::Response {
                     request_id,
-                    response: _,
+                    response,
+                    ..
                 } => {
-                    let _ = self
-                        .pending_block_update_requests
+                    self.pending_blockchain_requests
                         .remove(&request_id)
-                        .expect("Request to still be pending.");
+                        .expect("Request to still be pending.")
+                        .send(Ok(response.0))
+                        .unwrap_or_else(|e| {
+                            error!("Handle RequestResponseEvent match arm: {}. pending_blockchain_requests: {:?}", event_str, e);
+                        });
                 }
             },
             RequestResponseEvent::InboundFailure { .. } => {}
             RequestResponseEvent::OutboundFailure {
                 request_id, error, ..
             } => {
-                let _ = self
-                    .pending_block_update_requests
+                self.pending_blockchain_requests
                     .remove(&request_id)
                     .expect("Request to still be pending.")
-                    .send(Err(From::from(error)));
+                    .send(Err(From::from(error)))
+                    .unwrap_or_else(|e| {
+                        error!("Handle RequestResponseEvent match arm: {}. pending_blockchain_requests: {:?}", event_str, e);
+                    });
             }
             RequestResponseEvent::ResponseSent { .. } => {}
         }
@@ -306,6 +360,7 @@ impl PyrsiaEventLoop {
     // Handles all other events from the libp2p `Swarm`.
     async fn handle_swarm_event(&mut self, event: SwarmEvent<PyrsiaNetworkEvent, impl Error>) {
         trace!("Handle SwarmEvent: {:?}", event);
+        let event_str = format!("{:#?}", event);
         match event {
             SwarmEvent::Behaviour(_) => {
                 debug!("Unmatched Behaviour swarm event found: {:?}", event);
@@ -322,15 +377,22 @@ impl PyrsiaEventLoop {
             } => {
                 if endpoint.is_dialer() {
                     if let Some(sender) = self.pending_dial.remove(&peer_id) {
-                        let _ = sender.send(Ok(()));
+                        sender.send(Ok(())).unwrap_or_else(|_e| {
+                            error!("Handle SwarmEvent match arm: {}", event_str);
+                        });
                     }
                 }
             }
             SwarmEvent::ConnectionClosed { .. } => {}
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                 if let Some(peer_id) = peer_id {
+                    if peer_id == *self.swarm.local_peer_id() {
+                        warn!("The dialed node has the same peer ID as the current node: '{}'. Please make sure that every node has a unique peer ID.", peer_id);
+                    }
                     if let Some(sender) = self.pending_dial.remove(&peer_id) {
-                        let _ = sender.send(Err(error.into()));
+                        sender.send(Err(error.into())).unwrap_or_else(|_e| {
+                            error!("Handle SwarmEvent match arm: {}", event_str);
+                        });
                     }
                 }
             }
@@ -344,7 +406,9 @@ impl PyrsiaEventLoop {
             }
             SwarmEvent::ExpiredListenAddr { .. } => {}
             SwarmEvent::IncomingConnection { .. } => {}
-            SwarmEvent::IncomingConnectionError { .. } => {}
+            SwarmEvent::IncomingConnectionError { error, .. } => {
+                warn!("{}", error);
+            }
             SwarmEvent::ListenerClosed { .. } => {}
             SwarmEvent::ListenerError { .. } => {}
         }
@@ -353,12 +417,30 @@ impl PyrsiaEventLoop {
     // Handle incoming commands that are sent by the [`Client`].
     async fn handle_command(&mut self, command: Command) {
         trace!("Handle Command: {}", command);
+        let command_str = format!("{:#?}", command);
         match command {
+            Command::AddProbe {
+                peer_id,
+                probe_addr,
+                sender,
+            } => {
+                self.swarm
+                    .behaviour_mut()
+                    .auto_nat
+                    .add_server(peer_id, Some(probe_addr));
+                match sender.send(()) {
+                    Ok(_) => log::info!("Handled probe for AutoNAT"),
+                    Err(e) => log::error!("Could not handle probe for AutoNAT: {:?}", e),
+                }
+            }
             Command::Listen { addr, sender } => {
-                let _ = match self.swarm.listen_on(addr) {
+                match self.swarm.listen_on(addr) {
                     Ok(_) => sender.send(Ok(())),
                     Err(e) => sender.send(Err(e.into())),
-                };
+                }
+                .unwrap_or_else(|_e| {
+                    error!("Handle Command match arm: {}.", command_str);
+                });
             }
             Command::Dial {
                 peer_id,
@@ -374,7 +456,9 @@ impl PyrsiaEventLoop {
                             self.pending_dial.insert(peer_id, sender);
                         }
                         Err(e) => {
-                            let _ = sender.send(Err(e.into()));
+                            sender.send(Err(e.into())).unwrap_or_else(|_e| {
+                                error!("Handle Command match arm: {}.", command_str);
+                            });
                         }
                     }
                 }
@@ -386,6 +470,44 @@ impl PyrsiaEventLoop {
                     .kademlia
                     .get_closest_peers(peer_id);
                 self.pending_list_peers.insert(query_id, sender);
+            }
+            Command::Status { sender } => {
+                let swarm = &self.swarm;
+                let local_peer_id = *swarm.local_peer_id();
+                let local_peer = Protocol::P2p(local_peer_id.into());
+
+                let externalip = read_var("PYRSIA_EXTERNAL_IP", "");
+
+                let mut addr_map = HashSet::new();
+
+                for addr in swarm.listeners() {
+                    if !externalip.is_empty() {
+                        match externalip.parse() {
+                            Ok(ipv4_addr) => {
+                                let new_addr =
+                                    addr.replace(0, |_| Some(Protocol::Ip4(ipv4_addr))).unwrap();
+                                addr_map.insert(format!("{}{}", new_addr, local_peer));
+                            }
+                            Err(err) => {
+                                // don't map external ip, skip mapping and display error
+                                addr_map.insert(format!("{}{}", addr, local_peer));
+                                info!("Ipv4Addr parse error of {}: {}", externalip, err);
+                            }
+                        }
+                    } else {
+                        addr_map.insert(format!("{}{}", addr, local_peer));
+                    }
+                }
+
+                let peer_addrs = addr_map.into_iter().collect::<Vec<_>>();
+
+                let status = Status {
+                    peers_count: swarm.connected_peers().count(),
+                    peer_id: local_peer_id.to_string(),
+                    peer_addrs,
+                };
+
+                sender.send(status).unwrap();
             }
             Command::Provide {
                 artifact_id,
@@ -444,21 +566,21 @@ impl PyrsiaEventLoop {
                     .send_response(channel, IdleMetricResponse(metric))
                     .expect("Connection to peer to be still open.");
             }
-            Command::RequestBlockUpdate {
-                block_ordinal,
-                block,
-                peer,
-                sender,
-            } => {
+            Command::RequestBlockchain { data, peer, sender } => {
                 let request_id = self
                     .swarm
                     .behaviour_mut()
-                    .block_update_request_response
-                    .send_request(&peer, BlockUpdateRequest(block_ordinal, block));
-                self.pending_block_update_requests
-                    .insert(request_id, sender);
+                    .blockchain_request_response
+                    .send_request(&peer, BlockchainRequest(data));
+                self.pending_blockchain_requests.insert(request_id, sender);
             }
-            Command::RespondBlockUpdate {} => {}
+            Command::RespondBlockchain { data, channel } => {
+                self.swarm
+                    .behaviour_mut()
+                    .blockchain_request_response
+                    .send_response(channel, BlockchainResponse(data))
+                    .expect("Connection to peer to be still open.");
+            }
         }
     }
 }
@@ -472,18 +594,19 @@ pub enum PyrsiaEvent {
     IdleMetricRequest {
         channel: ResponseChannel<IdleMetricResponse>,
     },
-    BlockUpdateRequest {
-        block_ordinal: u64,
-        block: Vec<u8>,
+    BlockchainRequest {
+        data: Vec<u8>,
+        channel: ResponseChannel<BlockchainResponse>,
     },
 }
 
 #[cfg(test)]
+#[cfg(not(tarpaulin_include))]
 mod tests {
     use super::*;
     use crate::network::artifact_protocol::{ArtifactExchangeCodec, ArtifactExchangeProtocol};
     use crate::network::blockchain_protocol::{
-        BlockUpdateExchangeCodec, BlockUpdateExchangeProtocol,
+        BlockchainExchangeCodec, BlockchainExchangeProtocol,
     };
     use crate::network::client::Client;
     use crate::network::idle_metric_protocol::{
@@ -491,15 +614,11 @@ mod tests {
     };
     use libp2p::core::upgrade;
     use libp2p::core::Transport;
-    use libp2p::dns;
-    use libp2p::identify;
     use libp2p::identity::Keypair;
-    use libp2p::kad;
-    use libp2p::noise;
-    use libp2p::request_response;
     use libp2p::swarm::SwarmBuilder;
     use libp2p::tcp::{self, GenTcpConfig};
     use libp2p::yamux::YamuxConfig;
+    use libp2p::{autonat, dns, identify, kad, noise, request_response};
     use std::iter;
     use std::time::Duration;
 
@@ -512,17 +631,27 @@ mod tests {
             .into_authentic(&id_keys)
             .expect("Signing libp2p-noise static DH keypair failed.");
 
-        let tcp = tcp::TokioTcpTransport::new(GenTcpConfig::default().nodelay(true));
-        let dns = dns::TokioDnsConfig::system(tcp).unwrap();
+        let transport = tcp::TokioTcpTransport::new(GenTcpConfig::default().nodelay(true));
+        let dns = dns::TokioDnsConfig::system(transport).unwrap();
 
         let mem_transport = dns
             .upgrade(upgrade::Version::V1)
             .authenticate(noise::NoiseConfig::xx(noise_keys).into_authenticated())
             .multiplex(YamuxConfig::default())
-            .timeout(std::time::Duration::from_secs(20))
+            .timeout(Duration::from_secs(20))
             .boxed();
 
         let behaviour = PyrsiaNetworkBehaviour {
+            auto_nat: autonat::Behaviour::new(
+                peer_id,
+                autonat::Config {
+                    retry_interval: Duration::from_secs(10),
+                    refresh_interval: Duration::from_secs(30),
+                    boot_delay: Duration::from_secs(5),
+                    throttle_server_period: Duration::ZERO,
+                    ..Default::default()
+                },
+            ),
             identify: identify::Identify::new(identify::IdentifyConfig::new(
                 "ipfs/1.0.0".to_owned(),
                 id_keys.public(),
@@ -544,10 +673,10 @@ mod tests {
                 )),
                 Default::default(),
             ),
-            block_update_request_response: request_response::RequestResponse::new(
-                BlockUpdateExchangeCodec(),
+            blockchain_request_response: request_response::RequestResponse::new(
+                BlockchainExchangeCodec(),
                 iter::once((
-                    BlockUpdateExchangeProtocol(),
+                    BlockchainExchangeProtocol(),
                     request_response::ProtocolSupport::Full,
                 )),
                 Default::default(),
@@ -658,5 +787,26 @@ mod tests {
         let peers_in_client_2 = p2p_client_2.list_peers().await.unwrap();
         assert!(peers_in_client_1.contains(&p2p_client_2.local_peer_id));
         assert!(peers_in_client_2.contains(&p2p_client_1.local_peer_id));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_dial_with_invalid_peer_id() {
+        let (mut p2p_client_1, event_loop_1) = create_test_swarm();
+        let (p2p_client_2, _) = create_test_swarm();
+
+        tokio::spawn(event_loop_1.run());
+
+        p2p_client_1
+            .listen(&"/ip4/127.0.0.1/tcp/44132".parse().unwrap())
+            .await
+            .unwrap();
+
+        let result = p2p_client_1
+            .dial(
+                &p2p_client_2.local_peer_id,
+                &"/ip4/127.0.0.1/tcp/44133".parse().unwrap(),
+            )
+            .await;
+        assert!(result.is_err());
     }
 }
