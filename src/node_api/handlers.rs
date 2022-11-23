@@ -15,4 +15,3 @@
 */
 
 pub mod swarm;
-pub use crate::docker::error_util::*;

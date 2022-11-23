@@ -14,16 +14,14 @@
    limitations under the License.
 */
 
-extern crate hex;
-
 use codec::{Decode, Encode, Error as CodecError, Input};
 use libp2p::core::identity::ed25519::PublicKey;
 use log::{debug, trace};
 
 // Convenience wrapper around a ed25519::PublicKey to support the parity scale coded required by aleph_bft
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct VerifyKey {
-    public: PublicKey,
+pub struct VerifyKey {
+    pub public: PublicKey,
 }
 
 impl VerifyKey {

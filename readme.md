@@ -1,55 +1,99 @@
+# Welcome to Pyrsia
+
 ![logo](https://raw.githubusercontent.com/pyrsia/.github/main/images/logo-color.svg)
 
-> Zero-Trust Decentralized Package Network
+> Decentralized Package Network
 
 ## Current Development Phase
 
 _📢 We are looking for your feedback!_
 
-This project is currently in the "sandbox" 🏖️. We are actively exploring new concepts and tools.
-The code, workflows, and ideas are subject to breaking changes at any time in this early stage of development.
+This project is currently in "early alpha". We are actively building on our minimal viable product which will continue
+to evolve over time as we add new features and support more workflows.
+
+Have a use case or workflow you would like to see supported? Open an issue or share on [Slack](https://cdeliveryfdn.slack.com/join/shared_invite/zt-1eryue9cw-9YpgrfIfsTcDS~hGHchURg).
+Check out our [Get Involved](/docs/get_involved/) page for more ways to connect.
 
 ### Primary Focus
 
 To get off the ground the focus is strictly on the peer-to-peer distribution of Docker images backed by a blockchain of identifiers.
 
-## Looking to Contribute?
+## Looking to Contribute
 
 Take a moment to review our [contributing guidelines](https://github.com/pyrsia/.github/blob/main/contributing.md).
-You can join our community on [Slack](https://openssf.slack.com/archives/C02RC7Y5EUV) or participate in a [meeting](https://pyrsia.io/events/) to pick up an issue. We also have our [Local Setup Guide](docs/local_dev_setup.md) to help.
+You can join our community on [Slack](https://cdeliveryfdn.slack.com/join/shared_invite/zt-1eryue9cw-9YpgrfIfsTcDS~hGHchURg) or participate in a [meeting](https://pyrsia.io/docs/social/#calendar) to pick up an issue. We also have our [Local Setup Guide](/docs/community/get_involved/local_dev_setup/) to help.
 
-## Install Pyrsia and Joining the Network
+## Install Pyrsia and Join the Network
 
-There's a web script that will set everything up.
+There are mutiple options to run Pyrsia:
 
-```sh
-curl -sS https://pyrsia.io/install.sh | sh
+- [Build Pyrsia from source](/docs/community/get_involved/local_dev_setup.md).
+
+- [Use a pre-built installer](/docs/tutorials/quick-installation/)
+
+- [Run Pyrsia inside Docker](/docs/tutorials/quick-installation/#run-pyrsia-in-docker)
+
+Once you have a `pyrsia_node` binary, just run it like this:
+
+```shell
+pyrsia_node
 ```
 
-For more options and information, checkout our [online tutorial](https://pyrsia.io/guides/userguide/installation-and-support/ubuntu-installation/)
+Optionally setting an environment variable `RUST_LOG=debug` first if you want to
+see debug output.
 
 ### Downloading Your First Artifact
 
-Let's exercies the [Docker](https://www.docker.com/) and [DockerHub](https://hub.docker.com/) integration.
+Let's exercise the [Docker](https://www.docker.com/) integration.
 
-```sh
-docker pull ubuntu
+Configure your Docker installation to use Pyrsia as a registry mirror.
+
+On Windows or macOS, open your Docker Desktop -> Settings ->
+Docker Engine where Docker allows you to set registry-mirrors. Configure your node
+as a registry mirror by adding/editing the following in the configuration:
+
+```jsonc
+ "registry-mirrors": [
+   "http://0.0.0.0:7888"
+ ]
 ```
 
-### Node and CLI
+On Linux, you'll find this configuration in the file `/etc/docker/daemon.json`.
 
-There are two components of this project
+See [this page](/docs/tutorials/docker/#configure-docker) for more information about
+configuring Docker.
 
-- **[CLI](pyrsia_cli/)**: A basic interface which communicates with a node.
-- **[Node](pyrsia_node/)**: An instance of the Pyrsia daemon which can participate in the network with other nodes.
+Let's try to pull an artifact from the Pyrsia network, but first make sure it is
+not yet in your local Docker cache:
+
+```sh
+docker rmi alpine:3.16.2
+```
+
+Then pull the image:
+
+```sh
+docker pull alpine:3.16.2
+```
+
+Congratulations! The alpine Docker image was now retrieved from the Pyrsia network.
+You can verify this in the Pyrsia logs.
 
 ### Connecting with other Nodes
 
-The Pyrsia node will always join the "main net" and connect with other peers. You can see this using the CLI's "status" command:
+The Pyrsia node will always join the Pyrsia network and connect with other peers.
+You can see this in the logs or use the CLI's "status" command:
 
 ```sh
-$ ./pyrsia node -s
-Connected Peers Count:   17 # Shows the number of visible peers
-Artifacts Count:         12 # Total number of artifacts cached locally
-Total Disk Available:    983112
+$ ./pyrsia status
+Connected Peers Count:   1
 ```
+
+### Integration Tests
+
+- **[Repository](https://github.com/pyrsia/pyrsia-integration-tests)**: Pyrsia integration tests git repository.
+- **[Test Results](https://github.com/pyrsia/pyrsia-integration-tests/actions/workflows/run-bats-tests.yml)**: Pyrsia integration tests (daily) results.
+
+### Cloud Deployment
+
+Pyrsia nodes can be deployed on the cloud using [pyrsia_node helmcharts](https://artifacthub.io/packages/helm/pyrsia-nightly/pyrsia-node). These nodes will act as the Authority nodes and participate as boot nodes on the network.

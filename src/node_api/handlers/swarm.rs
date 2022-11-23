@@ -14,14 +14,79 @@
    limitations under the License.
 */
 
-use super::{RegistryError, RegistryErrorCode};
-use crate::network::p2p;
-use crate::node_manager::{handlers::*, model::cli::Status};
+use crate::artifact_service::model::PackageType;
+use crate::docker::error_util::{RegistryError, RegistryErrorCode};
+use crate::network::client::Client;
+use crate::node_api::model::cli::{
+    RequestAddAuthorizedNode, RequestDockerBuild, RequestDockerLog, RequestMavenBuild,
+    RequestMavenLog,
+};
+use crate::transparency_log::log::TransparencyLogService;
+
+use crate::artifact_service::service::ArtifactService;
+use libp2p::PeerId;
 use log::debug;
+use std::str::FromStr;
 use warp::{http::StatusCode, Rejection, Reply};
 
-pub async fn handle_get_peers(mut p2p_client: p2p::Client) -> Result<impl Reply, Rejection> {
-    let peers = p2p_client.list_peers().await;
+pub async fn handle_add_authorized_node(
+    request_add_authorized_node: RequestAddAuthorizedNode,
+    transparency_log_service: TransparencyLogService,
+) -> Result<impl Reply, Rejection> {
+    let peer_id =
+        PeerId::from_str(&request_add_authorized_node.peer_id).map_err(|_| RegistryError {
+            code: RegistryErrorCode::BadRequest(format!(
+                "PeerId has invalid format: {}",
+                request_add_authorized_node.peer_id
+            )),
+        })?;
+
+    transparency_log_service
+        .add_authorized_node(peer_id)
+        .await
+        .map_err(RegistryError::from)?;
+
+    Ok(warp::http::response::Builder::new()
+        .status(StatusCode::CREATED)
+        .body(""))
+}
+
+pub async fn handle_build_docker(
+    request_docker_build: RequestDockerBuild,
+    artifact_service: ArtifactService,
+) -> Result<impl Reply, Rejection> {
+    let build_id = artifact_service
+        .request_build(PackageType::Docker, request_docker_build.image)
+        .await
+        .map_err(RegistryError::from)?;
+
+    let build_id_as_json = serde_json::to_string(&build_id).map_err(RegistryError::from)?;
+
+    Ok(warp::http::response::Builder::new()
+        .header("Content-Type", "application/json")
+        .status(StatusCode::OK)
+        .body(build_id_as_json))
+}
+
+pub async fn handle_build_maven(
+    request_maven_build: RequestMavenBuild,
+    artifact_service: ArtifactService,
+) -> Result<impl Reply, Rejection> {
+    let build_id = artifact_service
+        .request_build(PackageType::Maven2, request_maven_build.gav)
+        .await
+        .map_err(RegistryError::from)?;
+
+    let build_id_as_json = serde_json::to_string(&build_id).map_err(RegistryError::from)?;
+
+    Ok(warp::http::response::Builder::new()
+        .header("Content-Type", "application/json")
+        .status(StatusCode::OK)
+        .body(build_id_as_json))
+}
+
+pub async fn handle_get_peers(mut p2p_client: Client) -> Result<impl Reply, Rejection> {
+    let peers = p2p_client.list_peers().await.map_err(RegistryError::from)?;
     debug!("Got received_peers: {:?}", peers);
 
     let str_peers: Vec<String> = peers.into_iter().map(|p| p.to_string()).collect();
@@ -34,30 +99,8 @@ pub async fn handle_get_peers(mut p2p_client: p2p::Client) -> Result<impl Reply,
         .unwrap())
 }
 
-pub async fn handle_get_status(mut p2p_client: p2p::Client) -> Result<impl Reply, Rejection> {
-    let peers = p2p_client.list_peers().await;
-
-    let art_count_result = get_arts_count();
-    if art_count_result.is_err() {
-        return Err(warp::reject::custom(RegistryError {
-            code: RegistryErrorCode::Unknown(art_count_result.err().unwrap().to_string()),
-        }));
-    }
-
-    let disk_space_result = disk_usage(ARTIFACTS_DIR.as_str());
-    if disk_space_result.is_err() {
-        return Err(warp::reject::custom(RegistryError {
-            code: RegistryErrorCode::Unknown(disk_space_result.err().unwrap().to_string()),
-        }));
-    }
-
-    let status = Status {
-        artifact_count: art_count_result.unwrap(),
-        peers_count: peers.len(),
-        peer_id: p2p_client.local_peer_id.to_string(),
-        disk_allocated: String::from(ALLOCATED_SPACE_FOR_ARTIFACTS),
-        disk_usage: format!("{:.4}", disk_space_result.unwrap()),
-    };
+pub async fn handle_get_status(mut p2p_client: Client) -> Result<impl Reply, Rejection> {
+    let status = p2p_client.status().await.map_err(RegistryError::from)?;
 
     let status_as_json = serde_json::to_string(&status).unwrap();
 
@@ -65,5 +108,39 @@ pub async fn handle_get_status(mut p2p_client: p2p::Client) -> Result<impl Reply
         .header("Content-Type", "application/json")
         .status(StatusCode::OK)
         .body(status_as_json)
+        .unwrap())
+}
+
+pub async fn handle_inspect_log_docker(
+    request_docker_log: RequestDockerLog,
+    transparency_log_service: TransparencyLogService,
+) -> Result<impl Reply, Rejection> {
+    let result = transparency_log_service
+        .search_transparency_logs(&PackageType::Docker, &request_docker_log.image)
+        .map_err(RegistryError::from)?;
+
+    let result_as_json = serde_json::to_string(&result).map_err(RegistryError::from)?;
+
+    Ok(warp::http::response::Builder::new()
+        .header("Content-Type", "application/json")
+        .status(StatusCode::OK)
+        .body(result_as_json)
+        .unwrap())
+}
+
+pub async fn handle_inspect_log_maven(
+    request_maven_log: RequestMavenLog,
+    transparency_log_service: TransparencyLogService,
+) -> Result<impl Reply, Rejection> {
+    let result = transparency_log_service
+        .search_transparency_logs(&PackageType::Maven2, &request_maven_log.gav)
+        .map_err(RegistryError::from)?;
+
+    let result_as_json = serde_json::to_string(&result).map_err(RegistryError::from)?;
+
+    Ok(warp::http::response::Builder::new()
+        .header("Content-Type", "application/json")
+        .status(StatusCode::OK)
+        .body(result_as_json)
         .unwrap())
 }

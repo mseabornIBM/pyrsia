@@ -93,6 +93,7 @@ impl aleph_bft::Index for KeyBox {
 }
 
 #[cfg(test)]
+#[cfg(not(tarpaulin_include))]
 mod tests {
     use super::*;
     use aleph_bft::KeyBox as AlephKeyBox;
@@ -106,6 +107,6 @@ mod tests {
         );
         let sign: Signature = key_box.sign(b"hello world!").await;
 
-        assert_eq!(key_box.verify(b"hello world", &sign, 0.into()), false);
+        assert!(!key_box.verify(b"hello world", &sign, 0.into()));
     }
 }

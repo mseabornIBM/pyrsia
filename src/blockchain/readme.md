@@ -2,17 +2,15 @@
 
 This crate provides the "input" and "output" trait for interacting with the network consensus.
 
-This will encompase:
+This will encompass:
 
 - recording new "transaction" accepting generic payload
 - returning finalized blocks
 
-## Getting started
+This can be built from the project root since it's a part of the workspace.
 
-This can be built from the project root since it's apart of the workspace.
+## Running the example Node
 
-### Running the example Node
-
-```
-cargo build --example simple_node
+```sh
+cargo build --examples
 ```

@@ -15,45 +15,82 @@
 */
 
 pub mod cli;
-pub mod commands;
 
 use cli::handlers::*;
 use cli::parser::*;
-extern crate clap;
 
-extern crate pyrsia;
+const CONF_FILE_PATH_MSG_STARTER: &str = "Config file path:";
 
 #[tokio::main]
 async fn main() {
     // parsing command line arguments
     let matches = cli_parser();
 
-    // checking and preparing responses for each command and arguments
+    // checking and preparing responses for each command and its arguments if applicable
 
     match matches.subcommand() {
-        // config subcommand
         Some(("config", config_matches)) => {
-            if config_matches.is_present("add") || config_matches.is_present("edit") {
-                config_add();
+            match config_matches.subcommand() {
+                Some(("edit", edit_config_matches)) => {
+                    if vec!["host", "port", "diskspace"]
+                        .into_iter()
+                        .any(|opt_str| edit_config_matches.contains_id(opt_str))
+                    {
+                        let host_name = edit_config_matches.try_get_one::<String>("host").unwrap();
+                        let port = edit_config_matches.try_get_one::<String>("port").unwrap();
+                        let diskspace = edit_config_matches
+                            .try_get_one::<String>("diskspace")
+                            .unwrap();
+                        match config_edit(host_name.cloned(), port.cloned(), diskspace.cloned()) {
+                            Ok(_) => {
+                                println!("Node configuration Saved !!");
+                            }
+                            Err(error) => {
+                                eprintln!("ERROR: {}", error);
+                            }
+                        }
+                    } else {
+                        config_add();
+                    }
+                }
+                _ => {}
             }
             if config_matches.is_present("show") {
                 config_show();
             }
         }
-
-        Some(("node", node_matches)) => {
-            if node_matches.is_present("ping") {
-                node_ping().await;
-            } else if node_matches.is_present("list") {
-                node_list().await;
-            } else if node_matches.is_present("status") {
-                node_status().await;
-            } else {
-                println!("No help topic for '{:?}'", node_matches)
-            }
+        Some(("authorize", authorize_matches)) => {
+            authorize(authorize_matches.get_one::<String>("peer").unwrap()).await;
         }
-        None => println!("No subcommand was used"),
-
-        _ => unreachable!(),
+        Some(("build", build_matches)) => match build_matches.subcommand() {
+            Some(("docker", docker_matches)) => {
+                request_docker_build(docker_matches.get_one::<String>("image").unwrap()).await;
+            }
+            Some(("maven", maven_matches)) => {
+                request_maven_build(maven_matches.get_one::<String>("gav").unwrap()).await;
+            }
+            _ => {}
+        },
+        Some(("list", _config_matches)) => {
+            node_list().await;
+        }
+        Some(("ping", _config_matches)) => {
+            node_ping().await;
+        }
+        Some(("status", _config_matches)) => {
+            node_status().await;
+        }
+        Some(("inspect-log", build_matches)) => match build_matches.subcommand() {
+            Some(("docker", docker_matches)) => {
+                inspect_docker_transparency_log(docker_matches.get_one::<String>("image").unwrap())
+                    .await;
+            }
+            Some(("maven", maven_matches)) => {
+                inspect_maven_transparency_log(maven_matches.get_one::<String>("gav").unwrap())
+                    .await;
+            }
+            _ => {}
+        },
+        _ => {} //this should be handled by clap arg_required_else_help
     }
 }

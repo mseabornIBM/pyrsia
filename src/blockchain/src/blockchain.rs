@@ -15,103 +15,87 @@
 */
 
 use libp2p::identity;
+use libp2p::identity::Keypair::Ed25519;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fmt::{self, Debug, Display, Formatter};
+use std::fmt::{self, Debug, Formatter};
+use std::path::{Path, PathBuf};
 
-use super::block::*;
+use crate::error::BlockchainError;
+use crate::structures::header::Ordinal;
+
 use super::crypto::hash_algorithm::HashDigest;
-use super::header::*;
+use super::structures::{
+    block::Block,
+    chain::Chain,
+    header::Address,
+    transaction::{Transaction, TransactionType},
+};
 
-/// BlockchainId identifies the current chain
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum BlockchainId {
-    Pyrsia,
-}
+pub type TransactionCallback = dyn FnOnce(Transaction) + Send + Sync;
 
 /// Define Supported Signature Algorithm
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum SignatureAlgorithm {
     Ed25519,
 }
-
-/// Define Configuration Information
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct Config {
-    pub blockchain_id: BlockchainId,
-    pub signature_algorithm: SignatureAlgorithm,
-    pub key_size: u32,
-}
-
-impl Config {
-    pub fn new() -> Self {
-        Self {
-            blockchain_id: BlockchainId::Pyrsia,
-            signature_algorithm: SignatureAlgorithm::Ed25519,
-            key_size: 32, //256bits
-        }
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[derive(Serialize, Deserialize)]
+#[derive(Default)]
 pub struct Blockchain {
-    #[serde(skip)]
-    // this should actually be a Map<Transaction,Vec<OnTransactionSettled>> but that's later
-    pub trans_observers: HashMap<Transaction, Box<dyn FnOnce(Transaction)>>,
-    #[serde(skip)]
-    pub block_observers: Vec<Box<dyn FnMut(Block)>>,
-    pub blocks: Vec<Block>,
+    // trans_observers may be only used internally by blockchain service
+    trans_observers: HashMap<Transaction, Box<TransactionCallback>>,
+    // chain is the blocks of the blockchain
+    chain: Chain,
+    // the directory on the local file system to use for persisting the blocks in the blockchain
+    blockchain_path: PathBuf,
 }
 
 impl Debug for Blockchain {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let Blockchain {
-            trans_observers: _,
-            blocks,
-            block_observers: _,
-        } = self;
-
         f.debug_struct("Blockchain")
-            .field("blocks", blocks)
+            .field("chain", &self.chain)
             .field("trans_observers", &self.trans_observers.len())
-            .field("block_observers", &self.block_observers.len())
             .finish()
     }
 }
 
 impl Blockchain {
-    pub fn new(keypair: &identity::ed25519::Keypair) -> Self {
-        let local_id = HashDigest::new(&get_publickey_from_keypair(&keypair).encode());
+    pub async fn new(
+        keypair: &identity::ed25519::Keypair,
+        blockchain_path: impl AsRef<Path>,
+    ) -> Result<Self, BlockchainError> {
+        let mut chain: Chain = Default::default();
+        chain.load_blocks(&blockchain_path).await?;
+
+        // Make the "genesis" block
+        if chain.is_empty() {
+            let local_id = Address::from(identity::PublicKey::Ed25519(keypair.public()));
+            let transaction = Transaction::new(
+                TransactionType::Create,
+                local_id,
+                "this is the first reserved transaction".as_bytes().to_vec(),
+                keypair,
+            );
+
+            let block = Block::new(HashDigest::new(b""), 0, Vec::from([transaction]), keypair);
+            Blockchain::save_block(&mut chain, block, &blockchain_path).await?
+        }
+
+        Ok(Self {
+            trans_observers: Default::default(),
+            chain,
+            blockchain_path: blockchain_path.as_ref().to_path_buf(),
+        })
+    }
+
+    pub fn empty_new(blockchain_path: impl AsRef<Path>) -> Self {
         Self {
             trans_observers: Default::default(),
-            block_observers: vec![],
-            // this is the "genesis" blocks
-            blocks: Vec::from([Block::new(
-                Header::new(PartialHeader::new(
-                    HashDigest::new(b""),
-                    local_id,
-                    HashDigest::new(b""),
-                    1,
-                )),
-                Vec::from([Transaction::new(
-                    PartialTransaction::new(
-                        TransactionType::AddAuthority,
-                        local_id,
-                        "this needs to be the root authority".as_bytes().to_vec(),
-                    ),
-                    &keypair,
-                )]),
-                keypair,
-            )]),
+            chain: Default::default(),
+            blockchain_path: blockchain_path.as_ref().to_path_buf(),
         }
     }
-    pub fn submit_transaction<CallBack: 'static + FnOnce(Transaction)>(
+
+    pub fn submit_transaction<CallBack: 'static + FnOnce(Transaction) + Send + Sync>(
         &mut self,
         trans: Transaction,
         on_done: CallBack,
@@ -127,166 +111,282 @@ impl Blockchain {
         }
     }
 
-    pub fn add_block_listener<CallBack: 'static + FnMut(Block)>(
+    /// Add block after receiving payload and keypair
+    pub async fn add_block(
         &mut self,
-        on_block: CallBack,
-    ) -> &mut Self {
-        self.block_observers.push(Box::new(on_block));
-        self
+        payload: Vec<u8>,
+        local_key: &identity::Keypair,
+    ) -> Result<(), BlockchainError> {
+        let ed25519_key = match local_key {
+            Ed25519(some) => some,
+            _ => {
+                return Err(BlockchainError::InvalidKey(format!("{:?}", local_key)));
+            }
+        };
+
+        let submitter = Address::from(local_key.public());
+        let trans_vec = vec![Transaction::new(
+            TransactionType::Create,
+            submitter,
+            payload,
+            ed25519_key,
+        )];
+
+        let last_block = match self.last_block() {
+            Some(block) => block,
+            None => {
+                return Err(BlockchainError::EmptyBlockchain);
+            }
+        };
+
+        let block = Block::new(
+            last_block.header.hash(),
+            last_block.header.ordinal + 1,
+            trans_vec,
+            ed25519_key,
+        );
+
+        // TODO: Consensus algorithm will be refactored
+        self.commit_block(block.clone()).await
     }
 
-    pub fn notify_block_event(&mut self, block: Block) -> &mut Self {
-        self.block_observers
-            .iter_mut()
-            .for_each(|notify| notify(block.clone()));
-        self
+    /// Update block after receiving the new block from other peers
+    pub async fn update_block_from_peers(
+        &mut self,
+        block: Box<Block>,
+    ) -> Result<(), BlockchainError> {
+        self.commit_block(*block).await
     }
 
-    #[warn(dead_code)]
-    pub fn add_block(&mut self, block: Block) {
-        self.blocks.push(block);
-        self.notify_block_event(self.blocks.last().expect("block must exist").clone());
+    /// Commit block and notify block listeners
+    async fn commit_block(&mut self, block: Block) -> Result<(), BlockchainError> {
+        Self::save_block(&mut self.chain, block, self.blockchain_path.as_path()).await
     }
-}
 
-// Create a new block
-// why isn't this just Block::new
-pub fn new_block(
-    keypair: &identity::ed25519::Keypair,
-    transactions: &[Transaction],
-    parent_hash: HashDigest,
-    previous_number: u128,
-) -> Block {
-    let local_id = HashDigest::new(&get_publickey_from_keypair(keypair).encode());
-    let transaction_root = HashDigest::new(&bincode::serialize(transactions).unwrap());
-    let block_header = Header::new(PartialHeader::new(
-        parent_hash,
-        local_id,
-        transaction_root,
-        previous_number + 1,
-    ));
-    Block::new(block_header, transactions.to_vec(), keypair)
-}
+    pub fn last_block(&self) -> Option<Block> {
+        self.chain.last_block()
+    }
 
-//ToDo
-pub fn generate_ed25519() -> identity::Keypair {
-    //RFC8032
-    identity::Keypair::generate_ed25519()
-}
+    pub fn pull_blocks(&self, start: Ordinal, end: Ordinal) -> Result<Vec<Block>, BlockchainError> {
+        Ok(self.chain.retrieve_blocks(start, end))
+    }
 
-impl Display for Blockchain {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let json = serde_json::to_string_pretty(&self).expect("json format error");
-        write!(f, "{}", json)
+    async fn save_block(
+        chain: &mut Chain,
+        block: Block,
+        blockchain_path: impl AsRef<Path>,
+    ) -> Result<(), BlockchainError> {
+        let block_ordinal = block.header.ordinal;
+        chain.add_block(block);
+        chain
+            .save_block(
+                block_ordinal,
+                blockchain_path
+                    .as_ref()
+                    .to_path_buf()
+                    .join(format!("{}.ser", block_ordinal)),
+            )
+            .await
     }
 }
 
 #[cfg(test)]
+#[cfg(not(tarpaulin_include))]
 mod tests {
-    use std::cell::Cell;
-    use std::rc::Rc;
-
     use super::*;
+    use std::fs;
+    use std::sync::{Arc, Mutex};
 
-    #[test]
-    fn test_build_blockchain() -> Result<(), String> {
-        let keypair = generate_ed25519();
-        let ed25519_keypair = match keypair {
-            identity::Keypair::Ed25519(v) => v,
-            identity::Keypair::Rsa(_) => todo!(),
-            identity::Keypair::Secp256k1(_) => todo!(),
-        };
-        let local_id = HashDigest::new(&get_publickey_from_keypair(&ed25519_keypair).encode());
-        let mut chain = Blockchain::new(&ed25519_keypair);
+    fn create_tmp_dir() -> PathBuf {
+        tempfile::tempdir()
+            .expect("could not create temporary directory")
+            .into_path()
+    }
+
+    fn remove_tmp_dir(tmp_dir: PathBuf) {
+        if tmp_dir.exists() {
+            fs::remove_dir_all(&tmp_dir)
+                .unwrap_or_else(|_| panic!("unable to remove test directory {:?}", tmp_dir));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_build_blockchain() {
+        let tmp_dir = create_tmp_dir();
+        let keypair = identity::ed25519::Keypair::generate();
+        let local_id = Address::from(identity::PublicKey::Ed25519(keypair.public()));
+        let mut blockchain = Blockchain::new(&keypair, &tmp_dir)
+            .await
+            .expect("Blockchain should have been created.");
 
         let mut transactions = vec![];
         let data = "Hello First Transaction";
         let transaction = Transaction::new(
-            PartialTransaction::new(TransactionType::Create, local_id, data.as_bytes().to_vec()),
-            &ed25519_keypair,
+            TransactionType::Create,
+            local_id,
+            data.as_bytes().to_vec(),
+            &keypair,
         );
         transactions.push(transaction);
-        chain.add_block(new_block(
-            &ed25519_keypair,
-            &transactions,
-            chain.blocks[0].header.hash,
-            chain.blocks[0].header.number,
-        ));
-        assert_eq!(true, chain.blocks.last().unwrap().verify());
-        assert_eq!(2, chain.blocks.len());
-        Ok(())
+        assert_eq!(1, blockchain.chain.len());
+        blockchain
+            .commit_block(Block::new(
+                blockchain.chain.blocks()[0].header.hash(),
+                blockchain.chain.blocks()[0].header.ordinal + 1,
+                transactions,
+                &keypair,
+            ))
+            .await
+            .expect("Block should have been committed.");
+        assert!(blockchain.chain.blocks().last().unwrap().verify());
+        assert_eq!(2, blockchain.chain.len());
+
+        remove_tmp_dir(tmp_dir);
     }
 
-    #[test]
-    fn test_add_trans_listener() -> Result<(), String> {
-        let keypair = generate_ed25519();
-        let ed25519_keypair = match keypair {
-            identity::Keypair::Ed25519(v) => v,
-            identity::Keypair::Rsa(_) => todo!(),
-            identity::Keypair::Secp256k1(_) => todo!(),
-        };
-        let local_id = HashDigest::new(&get_publickey_from_keypair(&ed25519_keypair).encode());
-        let mut chain = Blockchain::new(&ed25519_keypair);
+    #[tokio::test]
+    async fn test_add_trans_listener() {
+        let tmp_dir = create_tmp_dir();
+        let keypair = identity::ed25519::Keypair::generate();
+        let local_id = Address::from(identity::PublicKey::Ed25519(keypair.public()));
+        let mut blockchain = Blockchain::new(&keypair, &tmp_dir)
+            .await
+            .expect("Blockchain should have been created.");
 
         let transaction = Transaction::new(
-            PartialTransaction::new(
-                TransactionType::Create,
-                local_id,
-                "some transaction".as_bytes().to_vec(),
-            ),
-            &ed25519_keypair,
+            TransactionType::Create,
+            local_id,
+            "some transaction".as_bytes().to_vec(),
+            &keypair,
         );
-        let called = Rc::new(Cell::new(false));
-        chain
+        let called = Arc::new(Mutex::new(false));
+        blockchain
             .submit_transaction(transaction.clone(), {
                 let called = called.clone();
                 let transaction = transaction.clone();
                 move |t: Transaction| {
                     assert_eq!(transaction, t);
-                    called.set(true)
+                    *called.lock().unwrap() = true;
                 }
             })
             .notify_transaction_settled(transaction);
-        assert!(called.get());
-        Ok(())
+        assert!(*called.lock().unwrap());
+
+        remove_tmp_dir(tmp_dir);
     }
 
-    #[test]
-    fn test_add_block_listener() -> Result<(), String> {
-        let ed25519_keypair = match generate_ed25519() {
-            identity::Keypair::Ed25519(v) => v,
-            identity::Keypair::Rsa(_) => todo!(),
-            identity::Keypair::Secp256k1(_) => todo!(),
-        };
-        let local_id = HashDigest::new(&get_publickey_from_keypair(&ed25519_keypair).encode());
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_last_block() {
+        let tmp_dir = create_tmp_dir();
+        let keypair = identity::ed25519::Keypair::generate();
+        let local_id = Address::from(identity::PublicKey::Ed25519(keypair.public()));
+        let mut blockchain = Blockchain::new(&keypair, &tmp_dir)
+            .await
+            .expect("Blockchain should have been created.");
 
-        let block_header = Header::new(PartialHeader::new(
-            HashDigest::new(b""),
+        let mut transactions = vec![];
+        let data = "Hello First Transaction";
+        let transaction = Transaction::new(
+            TransactionType::Create,
             local_id,
-            HashDigest::new(b""),
-            1,
-        ));
-
-        let block = Block::new(
-            block_header,
-            Vec::new(),
-            &identity::ed25519::Keypair::generate(),
+            data.as_bytes().to_vec(),
+            &keypair,
         );
-        let mut chain = Blockchain::new(&ed25519_keypair);
-        let called = Rc::new(Cell::new(false));
+        transactions.push(transaction);
+        assert_eq!(1, blockchain.chain.len());
+        blockchain
+            .commit_block(Block::new(
+                blockchain.chain.blocks()[0].header.hash(),
+                blockchain.chain.blocks()[0].header.ordinal + 1,
+                transactions,
+                &keypair,
+            ))
+            .await
+            .expect("Block should have been committed.");
+        assert_ne!(None, blockchain.chain.last_block());
 
-        chain
-            .add_block_listener({
-                let called = called.clone();
-                let block = block.clone();
-                move |b: Block| {
-                    assert_eq!(block, b);
-                    called.set(true);
-                }
-            })
-            .add_block(block);
+        remove_tmp_dir(tmp_dir);
+    }
 
-        assert!(called.get()); // called is still false
-        Ok(())
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_add_block() {
+        let tmp_dir = create_tmp_dir();
+        let keypair = identity::Keypair::generate_ed25519();
+        let ed25519_key = match keypair.clone() {
+            Ed25519(some) => some,
+            _ => panic!("Key format is wrong"),
+        };
+        let mut blockchain = Blockchain::new(&ed25519_key, &tmp_dir)
+            .await
+            .expect("Blockchain should have been created.");
+
+        let data = "Hello First Transaction";
+
+        let result = blockchain
+            .add_block(data.as_bytes().to_vec(), &keypair)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            b"Hello First Transaction".to_vec(),
+            blockchain.chain.last_block().unwrap().transactions[0].payload()
+        );
+
+        remove_tmp_dir(tmp_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_update_block_from_peer() {
+        let tmp_dir = create_tmp_dir();
+        let keypair = identity::Keypair::generate_ed25519();
+        let ed25519_key = match keypair.clone() {
+            Ed25519(some) => some,
+            _ => panic!("Key format is wrong"),
+        };
+
+        let mut blockchain = Blockchain::new(&ed25519_key, &tmp_dir)
+            .await
+            .expect("Blockchain should have been created.");
+
+        let block = Box::new(Block::new(HashDigest::new(b""), 1, vec![], &ed25519_key));
+
+        let result = blockchain.update_block_from_peers(block).await;
+        assert!(result.is_ok());
+
+        remove_tmp_dir(tmp_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_pull_block() {
+        let tmp_dir = create_tmp_dir();
+        let keypair = identity::ed25519::Keypair::generate();
+        let local_id = Address::from(identity::PublicKey::Ed25519(keypair.public()));
+        let mut blockchain = Blockchain::new(&keypair, &tmp_dir)
+            .await
+            .expect("Blockchain should have been created.");
+
+        let mut transactions = vec![];
+        let data = "Hello First Transaction";
+        let transaction = Transaction::new(
+            TransactionType::Create,
+            local_id,
+            data.as_bytes().to_vec(),
+            &keypair,
+        );
+        transactions.push(transaction);
+        assert_eq!(1, blockchain.chain.len());
+        blockchain
+            .commit_block(Block::new(
+                blockchain.chain.blocks()[0].header.hash(),
+                blockchain.chain.blocks()[0].header.ordinal + 1,
+                transactions,
+                &keypair,
+            ))
+            .await
+            .expect("Block should have been committed.");
+
+        assert_eq!(1, blockchain.pull_blocks(0, 0).unwrap().len());
+        assert_eq!(0, blockchain.pull_blocks(0, 2).unwrap().len());
+
+        remove_tmp_dir(tmp_dir);
     }
 }

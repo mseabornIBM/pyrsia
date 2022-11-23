@@ -14,12 +14,13 @@
    limitations under the License.
 */
 
-extern crate aleph_bft;
-
+use codec::{Decode, Encode};
 use multihash::{Code, Multihash, MultihashDigest};
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(
+    Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Decode, Encode, PartialOrd,
+)]
 pub struct HashDigest {
     multihash: Multihash,
 }
@@ -48,6 +49,7 @@ impl aleph_bft::Hasher for HashDigest {
 }
 
 #[cfg(test)]
+#[cfg(not(tarpaulin_include))]
 mod tests {
     use super::*;
     use aleph_bft::Hasher;

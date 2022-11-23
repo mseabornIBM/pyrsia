@@ -19,10 +19,15 @@ use libp2p::Multiaddr;
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_LISTEN_ADDRESS: &str = "/ip4/0.0.0.0/tcp/0";
+const DEFAULT_MAX_PROVIDED_KEYS: &str = "32768";
+const DEFAULT_MAPPING_SERVICE_ENDPOINT: &str =
+    "https://raw.githubusercontent.com/pyrsia/pyrsia-mappings/main/";
+const DEFAULT_PIPELINE_SERVICE_ENDPOINT: &str = "http://localhost:8080";
 const DEFAULT_PORT: &str = "7888";
+const DEFAULT_BOOTSTRAP_URL: &str = "http://boot.pyrsia.link/status";
 
 /// Application to connect to and participate in the Pyrsia network
-#[derive(Debug, Parser)]
+#[derive(Clone, Debug, Parser)]
 #[clap(name = "Pyrsia Node")]
 pub struct PyrsiaNodeArgs {
     /// The host address to bind to for the Docker API
@@ -37,4 +42,24 @@ pub struct PyrsiaNodeArgs {
     /// An address to connect with another Pyrsia Node (eg /ip4/127.0.0.1/tcp/45153/p2p/12D3KooWKsHbKbcVgyiRRgeXGCK4bp3MngnSU7ioeKTfQzd18B2v)
     #[clap(long, short = 'P')]
     pub peer: Option<Multiaddr>,
+    /// Initialization mode, used only for the first authorized node in the Pyrsia network to initialize the Pyrsia network
+    #[clap(long)]
+    pub init_blockchain: bool,
+    /// An address to use for probing AutoNAT connections
+    #[clap(long, short = 'R')]
+    pub probe: Option<Multiaddr>,
+    /// listen_only mode - don't try to connect to any peers at startup
+    #[clap(long)]
+    pub listen_only: bool,
+    #[clap(long, short = 'B', default_value = DEFAULT_BOOTSTRAP_URL)]
+    pub bootstrap_url: String,
+    /// The maximum number of keys that can be provided on the network by this Pyrsia Node.
+    #[clap(long, default_value = DEFAULT_MAX_PROVIDED_KEYS)]
+    pub max_provided_keys: usize,
+    /// The http endpoint where the mapping service will fetch mapping info from.
+    #[clap(long, default_value = DEFAULT_MAPPING_SERVICE_ENDPOINT)]
+    pub mapping_service_endpoint: String,
+    /// The http endpoint of the external build pipeline that the pipeline service will use to communicate with.
+    #[clap(long, default_value = DEFAULT_PIPELINE_SERVICE_ENDPOINT)]
+    pub pipeline_service_endpoint: String,
 }

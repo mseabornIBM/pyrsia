@@ -15,15 +15,14 @@
    limitations under the License.
 */
 
-use crate::network::p2p;
+use crate::artifact_service::service::ArtifactService;
 
 use super::handlers::blobs::*;
 use super::handlers::manifests::*;
-use std::collections::HashMap;
 use warp::Filter;
 
 pub fn make_docker_routes(
-    p2p_client: p2p::Client,
+    artifact_service: ArtifactService,
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     let empty_json = "{}";
     let v2_base = warp::path("v2")
@@ -39,42 +38,192 @@ pub fn make_docker_routes(
             "application/json",
         ));
 
-    let v2_manifests = warp::path!("v2" / "library" / String / "manifests" / String)
-        .and(warp::get().or(warp::head()).unify())
+    let artifact_service_filter = warp::any().map(move || artifact_service.clone());
+
+    let v2_manifests_get = warp::path!("v2" / "library" / String / "manifests" / String)
+        .and(warp::get())
+        .and(artifact_service_filter.clone())
+        .and_then(fetch_manifest_or_build);
+
+    let v2_manifests_head = warp::path!("v2" / "library" / String / "manifests" / String)
+        .and(warp::head())
+        .and(artifact_service_filter.clone())
         .and_then(fetch_manifest);
-    let v2_manifests_put_docker = warp::path!("v2" / "library" / String / "manifests" / String)
-        .and(warp::put())
-        .and(warp::header::exact(
-            "Content-Type",
-            "application/vnd.docker.distribution.manifest.v2+json",
-        ))
-        .and(warp::body::bytes())
-        .and_then(put_manifest);
 
     let v2_blobs = warp::path!("v2" / "library" / String / "blobs" / String)
-        .and(warp::get().or(warp::head()).unify())
+        .and(warp::get())
         .and(warp::path::end())
-        .and_then(move |name, hash| handle_get_blobs(p2p_client.clone(), name, hash));
-    let v2_blobs_post = warp::path!("v2" / "library" / String / "blobs" / "uploads")
-        .and(warp::post())
-        .and_then(handle_post_blob);
-    let v2_blobs_patch = warp::path!("v2" / "library" / String / "blobs" / "uploads" / String)
-        .and(warp::patch())
-        .and(warp::body::bytes())
-        .and_then(handle_patch_blob);
-    let v2_blobs_put = warp::path!("v2" / "library" / String / "blobs" / "uploads" / String)
-        .and(warp::put())
-        .and(warp::query::<HashMap<String, String>>())
-        .and(warp::body::bytes())
-        .and_then(handle_put_blob);
+        .and(artifact_service_filter)
+        .and_then(handle_get_blobs);
 
     warp::any().and(
         v2_base
-            .or(v2_manifests)
-            .or(v2_manifests_put_docker)
-            .or(v2_blobs)
-            .or(v2_blobs_post)
-            .or(v2_blobs_patch)
-            .or(v2_blobs_put),
+            .or(v2_manifests_get)
+            .or(v2_manifests_head)
+            .or(v2_blobs),
     )
+}
+
+#[cfg(test)]
+#[cfg(not(tarpaulin_include))]
+mod tests {
+    use super::*;
+    use crate::blockchain_service::service::BlockchainService;
+    use crate::build_service::event::BuildEventClient;
+    use crate::docker::error_util::{RegistryError, RegistryErrorCode};
+    use crate::network::client::command::Command;
+    use crate::network::client::Client;
+    use crate::transparency_log::log::TransparencyLogService;
+    use crate::util::test_util;
+    use libp2p::identity::Keypair;
+    use std::path::Path;
+    use std::str;
+    use std::sync::Arc;
+    use tokio::sync::{mpsc, Mutex};
+
+    fn create_p2p_client(local_keypair: &Keypair) -> (mpsc::Receiver<Command>, Client) {
+        let (command_sender, command_receiver) = mpsc::channel(1);
+        let p2p_client = Client {
+            sender: command_sender,
+            local_peer_id: local_keypair.public().to_peer_id(),
+        };
+
+        (command_receiver, p2p_client)
+    }
+
+    async fn create_blockchain_service(
+        local_keypair: &Keypair,
+        p2p_client: Client,
+        blockchain_path: impl AsRef<Path>,
+    ) -> BlockchainService {
+        let ed25519_keypair = match local_keypair {
+            libp2p::identity::Keypair::Ed25519(ref v) => v,
+            _ => {
+                panic!("Keypair Format Error");
+            }
+        };
+
+        BlockchainService::init_first_blockchain_node(
+            ed25519_keypair,
+            ed25519_keypair,
+            p2p_client,
+            blockchain_path,
+        )
+        .await
+        .expect("Creating BlockchainService failed")
+    }
+
+    async fn create_transparency_log_service(
+        artifact_path: impl AsRef<Path>,
+        local_keypair: Keypair,
+        p2p_client: Client,
+    ) -> TransparencyLogService {
+        let blockchain_service =
+            create_blockchain_service(&local_keypair, p2p_client, &artifact_path).await;
+
+        TransparencyLogService::new(artifact_path, Arc::new(Mutex::new(blockchain_service)))
+            .expect("Creating TransparencyLogService failed")
+    }
+
+    #[tokio::test]
+    async fn docker_routes_base() {
+        let tmp_dir = test_util::tests::setup();
+
+        let local_keypair = Keypair::generate_ed25519();
+        let (_command_receiver, p2p_client) = create_p2p_client(&local_keypair);
+        let transparency_log_service =
+            create_transparency_log_service(&tmp_dir, local_keypair, p2p_client.clone()).await;
+
+        let (build_event_sender, _build_event_receiver) = mpsc::channel(1);
+        let build_event_client = BuildEventClient::new(build_event_sender);
+        let artifact_service = ArtifactService::new(
+            &tmp_dir,
+            transparency_log_service,
+            build_event_client,
+            p2p_client,
+        )
+        .expect("Creating ArtifactService failed");
+
+        let filter = make_docker_routes(artifact_service);
+        let response = warp::test::request().path("/v2").reply(&filter).await;
+
+        let expected_body = "{}";
+
+        assert_eq!(response.status(), 200);
+        assert_eq!(expected_body, str::from_utf8(response.body()).unwrap());
+
+        test_util::tests::teardown(tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn docker_routes_blobs() {
+        let tmp_dir = test_util::tests::setup();
+
+        let local_keypair = Keypair::generate_ed25519();
+        let (_command_receiver, p2p_client) = create_p2p_client(&local_keypair);
+        let transparency_log_service =
+            create_transparency_log_service(&tmp_dir, local_keypair, p2p_client.clone()).await;
+
+        let (build_event_sender, _build_event_receiver) = mpsc::channel(1);
+        let build_event_client = BuildEventClient::new(build_event_sender);
+        let artifact_service = ArtifactService::new(
+            &tmp_dir,
+            transparency_log_service,
+            build_event_client,
+            p2p_client,
+        )
+        .expect("Creating ArtifactService failed");
+
+        let filter = make_docker_routes(artifact_service);
+        let response = warp::test::request()
+            .path("/v2/library/alpine/blobs/sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a")
+            .reply(&filter)
+            .await;
+
+        let expected_error = RegistryError {
+            code: RegistryErrorCode::BlobUnknown,
+        };
+        let expected_body = format!("Unhandled rejection: {:?}", expected_error);
+
+        assert_eq!(response.status(), 500);
+        assert_eq!(expected_body, str::from_utf8(response.body()).unwrap());
+
+        test_util::tests::teardown(tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn docker_routes_manifests() {
+        let tmp_dir = test_util::tests::setup();
+
+        let local_keypair = Keypair::generate_ed25519();
+        let (_command_receiver, p2p_client) = create_p2p_client(&local_keypair);
+        let transparency_log_service =
+            create_transparency_log_service(&tmp_dir, local_keypair, p2p_client.clone()).await;
+
+        let (build_event_sender, _build_event_receiver) = mpsc::channel(1);
+        let build_event_client = BuildEventClient::new(build_event_sender);
+        let artifact_service = ArtifactService::new(
+            &tmp_dir,
+            transparency_log_service,
+            build_event_client,
+            p2p_client,
+        )
+        .expect("Creating ArtifactService failed");
+
+        let filter = make_docker_routes(artifact_service);
+        let response = warp::test::request()
+            .path("/v2/library/alpine/manifests/1.15")
+            .reply(&filter)
+            .await;
+
+        let expected_error = RegistryError {
+            code: RegistryErrorCode::ManifestUnknown,
+        };
+        let expected_body = format!("Unhandled rejection: {:?}", expected_error);
+
+        assert_eq!(response.status(), 500);
+        assert_eq!(expected_body, str::from_utf8(response.body()).unwrap());
+
+        test_util::tests::teardown(tmp_dir);
+    }
 }

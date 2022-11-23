@@ -16,19 +16,16 @@
 
 #![allow(mixed_script_confusables)] // This is to allow structs created by a derive macro to have private fields that begin with the grek letter π
 
-extern crate lazy_static; // Must be done in crate root
-
-pub mod artifacts_repository;
+pub mod artifact_service;
+pub mod blockchain_service;
+pub mod build_service;
+pub mod cli_commands;
 pub mod docker;
-pub mod document_store;
-pub mod metadata_manager;
+pub mod java;
+pub mod logging;
 pub mod network;
 pub mod node_api;
-pub mod node_manager;
-pub use node_manager::model; // Expose nested module at the crate level
-pub mod logging;
+pub mod peer_metrics;
+pub mod transparency_log;
 pub mod util;
-
-// re-expose nested crates that need to be used together
-pub use signed;
-pub use signed_struct;
+pub mod verification_service;

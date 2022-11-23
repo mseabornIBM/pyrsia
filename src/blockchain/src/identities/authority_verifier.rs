@@ -45,7 +45,7 @@ impl AuthorityVerifier {
     pub fn verify(&self, msg: &[u8], sgn: &Signature, index: NodeIndex) -> bool {
         let sig = sgn.clone().to_bytes();
         match self.authorities.get(&index) {
-            Some(public_key) => public_key.verify(&msg.to_vec(), &sig),
+            Some(public_key) => public_key.verify(msg, &sig),
             None => {
                 warn!("No public key for {:?}", index);
                 false
@@ -73,6 +73,7 @@ impl AuthorityVerifier {
 }
 
 #[cfg(test)]
+#[cfg(not(tarpaulin_include))]
 mod tests {
     use super::*;
     use aleph_bft::PartialMultisignature;
@@ -85,7 +86,7 @@ mod tests {
 
         assert_eq!(verifier.node_count(), 0.into());
         assert_eq!(verifier.threshold(), 1);
-        assert_eq!(verifier.is_complete(b"hello world", &multi_signs), false);
+        assert!(!verifier.is_complete(b"hello world", &multi_signs));
     }
 
     #[test]
@@ -99,7 +100,7 @@ mod tests {
 
         assert_eq!(verifier.node_count(), 0.into());
         assert_eq!(verifier.threshold(), 1);
-        assert_eq!(verifier.is_complete(b"hello world", &multi_signs), false);
+        assert!(!verifier.is_complete(b"hello world", &multi_signs));
     }
 
     #[test]
@@ -116,6 +117,6 @@ mod tests {
 
         assert_eq!(verifier.node_count(), 1.into());
         assert_eq!(verifier.threshold(), 1);
-        assert_eq!(verifier.is_complete(b"hello world", &multi_signs), false);
+        assert!(!verifier.is_complete(b"hello world", &multi_signs));
     }
 }
