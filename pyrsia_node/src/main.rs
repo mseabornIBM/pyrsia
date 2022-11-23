@@ -19,6 +19,8 @@ pub mod network;
 
 use anyhow::{bail, Result};
 use args::parser::PyrsiaNodeArgs;
+use libp2p::identity::Keypair;
+use libp2p::PeerId;
 use network::handlers;
 use pyrsia::artifact_service::service::ArtifactService;
 use pyrsia::artifact_service::storage::ARTIFACTS_DIR;
@@ -33,6 +35,7 @@ use pyrsia::network::client::Client;
 use pyrsia::network::p2p;
 use pyrsia::node_api::routes::make_node_routes;
 use pyrsia::transparency_log::log::TransparencyLogService;
+use pyrsia::util::env_util::read_var;
 use pyrsia::util::keypair_util::{self, KEYPAIR_FILENAME};
 use pyrsia::verification_service::service::VerificationService;
 
@@ -54,13 +57,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let args = PyrsiaNodeArgs::parse();
 
     debug!("Create p2p components");
-    let (p2p_client, mut p2p_events, event_loop) = p2p::setup_libp2p_swarm(args.max_provided_keys)?;
+    let (p2p_client, local_keypair, mut p2p_events, event_loop) =
+        p2p::setup_libp2p_swarm(args.max_provided_keys)?;
 
     debug!("Start p2p event loop");
     tokio::spawn(event_loop.run());
 
-    debug!("Create blockchain service component");
-    let blockchain_service = setup_blockchain_service(p2p_client.clone())?;
+    debug!("Create blockchain service");
+    let blockchain_service =
+        setup_blockchain_service(local_keypair, p2p_client.clone(), &args).await?;
+    let blockchain_service = Arc::new(Mutex::new(blockchain_service));
 
     debug!("Create transparency log service");
     let transparency_log_service = setup_transparency_log_service(blockchain_service.clone())?;
@@ -74,12 +80,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         &args,
         artifact_service.clone(),
         transparency_log_service,
-        build_event_client,
         p2p_client.clone(),
     );
 
-    debug!("Start p2p components");
-    setup_p2p(p2p_client.clone(), &args).await?;
+    debug!("Establishing connection with p2p network");
+    establish_connection_with_p2p_network(
+        p2p_client.clone(),
+        artifact_service.clone(),
+        blockchain_service.clone(),
+        args.clone(),
+    )
+    .await;
+
+    debug!("Provide local artifacts");
+    artifact_service.clone().provide_local_artifacts().await?;
 
     debug!("Listen for p2p events");
     loop {
@@ -100,6 +114,29 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         warn!(
                             "This node failed to provide artifact with id {}. Error: {:?}",
                             artifact_id, error
+                        );
+                    }
+                }
+                pyrsia::network::event_loop::PyrsiaEvent::RequestBuild {
+                    package_type,
+                    package_specific_id,
+                    channel,
+                } => {
+                    debug!(
+                        "Main::p2p request build: {:?} : {}",
+                        package_type, package_specific_id
+                    );
+                    if let Err(error) = handlers::handle_request_build(
+                        build_event_client.clone(),
+                        package_type,
+                        &package_specific_id,
+                        channel,
+                    )
+                    .await
+                    {
+                        warn!(
+                            "This node failed to provide build with package type {:?} and id {}. Error: {:?}",
+                            package_type, package_specific_id, error
                         );
                     }
                 }
@@ -130,25 +167,62 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
-async fn setup_p2p(mut p2p_client: Client, args: &PyrsiaNodeArgs) -> anyhow::Result<()> {
+async fn establish_connection_with_p2p_network(
+    p2p_client: Client,
+    artifact_service: ArtifactService,
+    blockchain_service: Arc<Mutex<BlockchainService>>,
+    args: PyrsiaNodeArgs,
+) {
+    tokio::spawn(async move {
+        if let Some(other_peer_id) = connect_to_p2p_network(p2p_client, &args)
+            .await
+            .unwrap_or_else(|err| {
+                warn!("Failed to establish connection with p2p network: {:?}", err);
+                None
+            })
+        {
+            if !args.init_blockchain {
+                if let Err(err) = pull_block_from_other_nodes(
+                    artifact_service.clone(),
+                    blockchain_service.clone(),
+                    other_peer_id,
+                )
+                .await
+                {
+                    panic!("Failed to pull blocks from p2p network: {:?}", err);
+                }
+            }
+        }
+    });
+}
+
+async fn connect_to_p2p_network(
+    mut p2p_client: Client,
+    args: &PyrsiaNodeArgs,
+) -> anyhow::Result<Option<PeerId>> {
     p2p_client.listen(&args.listen_address).await?;
+    let mut other_peer_id: Option<PeerId> = None;
     if let Some(to_probe) = &args.probe {
         info!("Invoking probe");
-        handlers::probe_other_peer(p2p_client.clone(), to_probe).await
+        handlers::probe_other_peer(p2p_client.clone(), to_probe).await?;
+        other_peer_id = libp2p::PeerId::try_from_multiaddr(to_probe);
     } else if let Some(to_dial) = &args.peer {
         info!("Invoking dial");
-        handlers::dial_other_peer(p2p_client.clone(), to_dial).await
+        handlers::dial_other_peer(p2p_client.clone(), to_dial).await?;
+        other_peer_id = libp2p::PeerId::try_from_multiaddr(to_dial);
     } else if args.listen_only {
         info!("Pyrsia node will listen only. No attempt to connect to other nodes.");
-        Ok(())
     } else {
-        info!("Looking up bootstrap node");
+        info!("Looking up bootstrap node: {:?}", &args.bootstrap_url);
         let peer_addrs = load_peer_addrs(&args.bootstrap_url).await?;
         // Turbofish! https://doc.rust-lang.org/std/primitive.str.html#method.parse
         let pa = peer_addrs.parse::<libp2p::Multiaddr>()?;
         info!("Probing {:?}", pa);
-        handlers::probe_other_peer(p2p_client.clone(), &pa).await
+        handlers::probe_other_peer(p2p_client.clone(), &pa).await?;
+        other_peer_id = libp2p::PeerId::try_from_multiaddr(&pa);
     }
+
+    Ok(other_peer_id)
 }
 
 async fn load_peer_addrs(peer_url: &str) -> anyhow::Result<String> {
@@ -193,21 +267,48 @@ async fn load_peer_addrs(peer_url: &str) -> anyhow::Result<String> {
     }
 }
 
-fn setup_blockchain_service(p2p_client: Client) -> Result<Arc<Mutex<BlockchainService>>> {
-    let local_keypair =
-        keypair_util::load_or_generate_ed25519(PathBuf::from(KEYPAIR_FILENAME.as_str()));
-
-    let ed25519_keypair = match local_keypair {
+async fn setup_blockchain_service(
+    local_keypair: Keypair,
+    p2p_client: Client,
+    args: &PyrsiaNodeArgs,
+) -> Result<BlockchainService> {
+    let local_ed25519_keypair = match local_keypair {
         libp2p::identity::Keypair::Ed25519(v) => v,
         _ => {
             bail!("Keypair Format Error");
         }
     };
 
-    Ok(Arc::new(Mutex::new(BlockchainService::new(
-        &ed25519_keypair,
-        p2p_client,
-    ))))
+    let pyrsia_blockchain_path = read_var("PYRSIA_BLOCKCHAIN_PATH", "pyrsia/blockchain");
+
+    if args.init_blockchain {
+        let blockchain_keypair =
+            keypair_util::load_or_generate_ed25519(PathBuf::from(KEYPAIR_FILENAME.as_str()));
+
+        let blockchain_ed25519_keypair = match blockchain_keypair {
+            libp2p::identity::Keypair::Ed25519(v) => v,
+            _ => {
+                bail!("Keypair Format Error");
+            }
+        };
+
+        // Refactor to overloading(trait) later
+        BlockchainService::init_first_blockchain_node(
+            &local_ed25519_keypair,
+            &blockchain_ed25519_keypair,
+            p2p_client,
+            pyrsia_blockchain_path,
+        )
+        .await
+        .map_err(|e| e.into())
+    } else {
+        BlockchainService::init_other_blockchain_node(
+            &local_ed25519_keypair,
+            p2p_client,
+            pyrsia_blockchain_path,
+        )
+        .map_err(|e| e.into())
+    }
 }
 
 fn setup_transparency_log_service(
@@ -292,12 +393,11 @@ fn setup_http(
     args: &PyrsiaNodeArgs,
     artifact_service: ArtifactService,
     transparency_log_service: TransparencyLogService,
-    build_event_client: BuildEventClient,
     p2p_client: Client,
 ) {
     // Get host and port from the settings. Defaults to DEFAULT_HOST and DEFAULT_PORT
     debug!(
-        "Pyrsia Docker Node will bind to host = {}, port = {}",
+        "Pyrsia Node will bind to host = {}, port = {}",
         args.host, args.port
     );
 
@@ -308,9 +408,8 @@ fn setup_http(
 
     debug!("Setup HTTP routing");
     let docker_routes = make_docker_routes(artifact_service.clone());
-    let maven_routes = make_maven_routes(artifact_service);
-    let node_api_routes =
-        make_node_routes(build_event_client, p2p_client, transparency_log_service);
+    let maven_routes = make_maven_routes(artifact_service.clone());
+    let node_api_routes = make_node_routes(artifact_service, p2p_client, transparency_log_service);
     let all_routes = docker_routes.or(maven_routes).or(node_api_routes);
 
     debug!("Setup HTTP server");
@@ -323,7 +422,7 @@ fn setup_http(
     .bind_ephemeral(address);
 
     info!(
-        "Pyrsia Docker Node will start running on {}:{}",
+        "Pyrsia Node will start running on {}:{}",
         addr.ip(),
         addr.port()
     );
@@ -331,17 +430,22 @@ fn setup_http(
     tokio::spawn(server);
 }
 
-#[cfg(test)]
-#[cfg(not(tarpaulin_include))]
-mod tests {
-    use pyrsia::network::p2p;
+async fn pull_block_from_other_nodes(
+    mut artifact_service: ArtifactService,
+    blockchain_service: Arc<Mutex<BlockchainService>>,
+    other_peer_id: PeerId,
+) -> anyhow::Result<()> {
+    debug!("Blockchain start pulling blocks from other peers");
 
-    use crate::setup_blockchain_service;
+    let mut blockchain_service = blockchain_service.lock().await;
 
-    #[test]
-    fn setup_blockchain_success() {
-        let (p2p_client, _, _) = p2p::setup_libp2p_swarm(100).unwrap();
-        let blockchain_service = setup_blockchain_service(p2p_client.clone());
-        assert!(blockchain_service.is_ok());
+    let ordinal = blockchain_service
+        .init_pull_from_others(&other_peer_id)
+        .await?;
+    for block in blockchain_service.pull_blocks(1, ordinal).await? {
+        let payloads = block.fetch_payload();
+        artifact_service.handle_block_added(payloads).await?;
     }
+
+    Ok(())
 }

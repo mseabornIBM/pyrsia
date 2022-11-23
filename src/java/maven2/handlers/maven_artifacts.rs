@@ -17,7 +17,7 @@
 use crate::artifact_service::model::PackageType;
 use crate::artifact_service::service::ArtifactService;
 use crate::docker::error_util::{RegistryError, RegistryErrorCode};
-use anyhow::bail;
+use anyhow::{anyhow, bail};
 use log::debug;
 use warp::{http::StatusCode, Rejection, Reply};
 
@@ -26,6 +26,13 @@ pub async fn handle_get_maven_artifact(
     mut artifact_service: ArtifactService,
 ) -> Result<impl Reply, Rejection> {
     debug!("Requesting maven artifact: {}", full_path);
+    let package_specific_id = get_package_specific_id(&full_path).map_err(|err| {
+        debug!("Error getting package specific id for artifact: {:?}", err);
+        warp::reject::custom(RegistryError {
+            code: RegistryErrorCode::Unknown(err.to_string()),
+        })
+    })?;
+
     let package_specific_artifact_id =
         get_package_specific_artifact_id(&full_path).map_err(|err| {
             debug!(
@@ -39,11 +46,16 @@ pub async fn handle_get_maven_artifact(
 
     // request artifact
     debug!(
-        "Requesting artifact for id {}",
-        package_specific_artifact_id
+        "Requesting artifact with package specific id: {}, and package specific artifact id: {}. If not found a build will be requested",
+        package_specific_id, package_specific_artifact_id
     );
+
     let artifact_content = artifact_service
-        .get_artifact(PackageType::Maven2, &package_specific_artifact_id)
+        .get_artifact_or_build(
+            PackageType::Maven2,
+            &package_specific_id,
+            &package_specific_artifact_id,
+        )
         .await
         .map_err(|err| {
             debug!("Error retrieving artifact: {:?}", err);
@@ -59,7 +71,22 @@ pub async fn handle_get_maven_artifact(
         .unwrap())
 }
 
+fn get_package_specific_id(full_path: &str) -> Result<String, anyhow::Error> {
+    let (group_id, version, artifact_id, _file_name) = parse_artifact_from_full_path(full_path)?;
+    Ok(format!("{}:{}:{}", group_id, artifact_id, version))
+}
+
 fn get_package_specific_artifact_id(full_path: &str) -> Result<String, anyhow::Error> {
+    let (group_id, version, artifact_id, file_name) = parse_artifact_from_full_path(full_path)?;
+    Ok(format!(
+        "{}/{}/{}/{}",
+        group_id, artifact_id, version, file_name
+    ))
+}
+
+fn parse_artifact_from_full_path(
+    full_path: &str,
+) -> Result<(String, String, String, String), anyhow::Error> {
     // maven coordinates like "com.company:test:1.0" will produce a request
     // like: "GET /maven2/com/company/test/1.0/test-1.0.jar"
 
@@ -68,15 +95,21 @@ fn get_package_specific_artifact_id(full_path: &str) -> Result<String, anyhow::E
     if pieces.len() < 4 {
         bail!(format!("Error, invalid full path: {}", full_path));
     }
-    let file_name = pieces.pop().unwrap();
-    let version = pieces.pop().unwrap();
-    let artifact_id = pieces.pop().unwrap();
+    let file_name = pieces
+        .pop()
+        .ok_or_else(|| anyhow!("Error extracting the file name"))?
+        .to_string();
+    let version = pieces
+        .pop()
+        .ok_or_else(|| anyhow!("Error extracting the version"))?
+        .to_string();
+    let artifact_id = pieces
+        .pop()
+        .ok_or_else(|| anyhow!("Error extracting the artifact id"))?
+        .to_string();
     let group_id = pieces.join(".");
 
-    Ok(format!(
-        "{}/{}/{}/{}",
-        group_id, artifact_id, version, file_name
-    ))
+    Ok((group_id, version, artifact_id, file_name))
 }
 
 #[cfg(test)]
@@ -116,7 +149,11 @@ mod tests {
         (command_receiver, p2p_client)
     }
 
-    fn create_blockchain_service(local_keypair: &Keypair, p2p_client: Client) -> BlockchainService {
+    async fn create_blockchain_service(
+        local_keypair: &Keypair,
+        p2p_client: Client,
+        blockchain_path: impl AsRef<Path>,
+    ) -> BlockchainService {
         let ed25519_keypair = match local_keypair {
             libp2p::identity::Keypair::Ed25519(ref v) => v,
             _ => {
@@ -124,18 +161,49 @@ mod tests {
             }
         };
 
-        BlockchainService::new(ed25519_keypair, p2p_client)
+        BlockchainService::init_first_blockchain_node(
+            ed25519_keypair,
+            ed25519_keypair,
+            p2p_client,
+            blockchain_path,
+        )
+        .await
+        .expect("Creating BlockchainService failed")
     }
 
-    fn create_transparency_log_service<P: AsRef<Path>>(
-        artifact_path: P,
+    async fn create_transparency_log_service(
+        artifact_path: impl AsRef<Path>,
         local_keypair: Keypair,
         p2p_client: Client,
     ) -> TransparencyLogService {
-        let blockchain_service = create_blockchain_service(&local_keypair, p2p_client);
+        let blockchain_service =
+            create_blockchain_service(&local_keypair, p2p_client, &artifact_path).await;
 
         TransparencyLogService::new(artifact_path, Arc::new(Mutex::new(blockchain_service)))
             .expect("Creating TransparencyLogService failed")
+    }
+
+    #[test]
+    fn parse_full_path_test() {
+        let (group_id, version, artifact_id, file_name) =
+            parse_artifact_from_full_path(VALID_FULL_PATH).unwrap();
+        assert_eq!(group_id, "test");
+        assert_eq!(artifact_id, "test");
+        assert_eq!(version, "1.0");
+        assert_eq!(file_name, "test-1.0.jar");
+    }
+
+    #[test]
+    fn get_package_specific_id_test() {
+        assert_eq!(
+            get_package_specific_id(VALID_FULL_PATH).unwrap(),
+            VALID_MAVEN_ID
+        );
+    }
+
+    #[test]
+    fn get_package_specific_id_with_invalid_path_test() {
+        assert!(get_package_specific_id(INVALID_FULL_PATH).is_err());
     }
 
     #[test]
@@ -158,7 +226,7 @@ mod tests {
         let local_keypair = Keypair::generate_ed25519();
         let (mut command_receiver, p2p_client) = create_p2p_client(&local_keypair);
         let transparency_log_service =
-            create_transparency_log_service(&tmp_dir, local_keypair, p2p_client.clone());
+            create_transparency_log_service(&tmp_dir, local_keypair, p2p_client.clone()).await;
 
         tokio::spawn(async move {
             loop {

@@ -1,6 +1,11 @@
+---
+sidebar_position: 1
+---
+
 # Pyrsia demo: build Docker images from source
 
-> **Warning:** The build-from-source demo is still work-in-progress.
+> **Warning:** This tutorial is aimed at developers actively contributing to the
+> Pyrsia codebase. If you simply want to use Pyrsia, please have a look at [Configure Docker to use Pyrsia](/docs/tutorials/docker.md)
 
 This tutorial describes how to setup two Pyrsia nodes: one that acts as the authorized
 node and builds Docker images from source and makes them available in the Pyrsia network,
@@ -43,7 +48,7 @@ sequenceDiagram
     nodeB->>User: return docker image
 ```
 
-See the [architecture and use-cases](../developers/pyrsia-architecture-and-use-cases.md)
+See the [architecture and use-cases](pyrsia-architecture-and-use-cases.md)
 document for more information.
 
 ## Compile Pyrsia
@@ -87,12 +92,12 @@ cp target/debug/pyrsia_node nodeA
 cd nodeA
 ```
 
-And then run node A in listen-only mode, listening on a non-default port (because
+And then run node A in listen-only and init mode, listening on a non-default port (because
 we will run node B with default settings).
 
 ```sh
 RUST_LOG=pyrsia=debug DEV_MODE=on \
-./pyrsia_node --pipeline-service-endpoint http://localhost:8080 -p 7889 --listen-only true
+./pyrsia_node --pipeline-service-endpoint http://localhost:8080 -p 7889 --listen-only --init-blockchain
 ```
 
 Watch out for this kind of log:
@@ -124,7 +129,7 @@ The most important features of the build pipeline are:
 The current build pipeline prototype supports Maven and Docker builds.
 
 Download or clone the [prototype repo](https://github.com/tiainen/pyrsia_build_pipeline_prototype)
-and run as follows:
+and run as follows (`jq` must be installed locally before):
 
 ```sh
 cd pyrsia_build_pipeline_prototype
@@ -145,6 +150,45 @@ for use
  INFO  actix_server::server  > Tokio runtime found; starting in existing Tokio runtime
 ```
 
+## Authorize node A as a build node
+
+We will use the Pyrsia CLI to authorize node A as a build node.
+Since node A is running on port 7889, we will have to edit the Pyrsia CLI config:
+
+In a new terminal, while the Pyrsia nodes and the build pipeline prototype are
+running, run:
+
+```sh
+cd $PYRSIA_HOME/target/debug
+./pyrsia config --edit
+```
+
+And enter the correct values:
+
+```text
+Enter host:
+localhost
+Enter port:
+7889
+Enter disk space to be allocated to pyrsia(Please enter with units ex: 10 GB):
+10GB
+
+Node configuration Saved !!
+```
+
+Next you'll need to find out the peer id of node A. You can see that in its logs
+or you can query the `/status` endpoint like this: (assuming you have `jq` installed)
+
+```shell
+curl -s http://localhost:7889/status | jq  .peer_id
+```
+
+Once you know the peer id, authorize it like this:
+
+```shell
+./pyrsia authorize --peer <PEER_ID>
+```
+
 ## Run Pyrsia node B
 
 Now it's time to run our regular node: node B. Let's create another temporary
@@ -162,7 +206,7 @@ of node A. This multiaddress can be found in the logs of node A (see section
 
 ```sh
 RUST_LOG=pyrsia=debug DEV_MODE=on \
-./pyrsia_node -H 0.0.0.0 --peer /ip4/127.0.0.1/tcp/56662/p2p/12D3KooWBgWeXNT1EKXo2omRhZVmkbvPgzZ5BcGjTfgKr586BSAn
+./pyrsia_node --peer /ip4/127.0.0.1/tcp/56662/p2p/12D3KooWBgWeXNT1EKXo2omRhZVmkbvPgzZ5BcGjTfgKr586BSAn
 ```
 
 **Important**: do not simply copy/paste this command, the multiaddress on your
@@ -175,15 +219,18 @@ let's continue building an artifact and providing it on the network.
 
 In this section we will trigger a build for `alpine:3.16` on node A.
 
-We will use the Pyrsia CLI to trigger a build from source. Since we want to trigger
-the build on node A, which is running on port 7889, we will have to edit this config:
+We will use the Pyrsia CLI to trigger a build from source. We can send the build
+request to node B, which will relay the request to node A, which is an authorized
+build node. Node B, which is running on port 7888, we will have to edit this config
+again:
 
 In a new terminal, while the Pyrsia nodes and the build pipeline prototype are
 running, run:
 
 ```sh
- ./pyrsia config --edit
- ```
+cd $PYRSIA_HOME/target/debug
+./pyrsia config --edit
+```
 
 And enter the correct values:
 
@@ -191,8 +238,9 @@ And enter the correct values:
 Enter host:
 localhost
 Enter port:
-7889
+7888
 Enter disk space to be allocated to pyrsia(Please enter with units ex: 10 GB):
+10 GB
 
 Node configuration Saved !!
 ```
@@ -200,7 +248,7 @@ Node configuration Saved !!
 Then trigger the build from source, like this:
 
 ```sh
-./pyrsia build docker --image alpine:3.16
+./pyrsia build docker --image alpine:3.16.0
 ```
 
 The build trigger should return immediately providing a build ID:
@@ -317,7 +365,7 @@ on node A and provided on the p2p network.
  INFO  pyrsia::artifact_service::service > put_artifact with id: da341557-9150-4208-9474-f5884f799338
  INFO  pyrsia::artifact_service::storage > An artifact is being pushed to the artifact manager da341557-9150-4208-9474-f5884f799338
  DEBUG pyrsia::network::client           > p2p::Client::provide "da341557-9150-4208-9474-f5884f799338"
- ```
+```
 
 Now we are ready to use the published artifacts in our build workflow on node B
 as shown in the sample section below.
@@ -353,8 +401,8 @@ pull Docker images through Pyrsia.
 First make sure Alpine is not in local Docker cache, then pull Alpine:
 
 ```sh
-docker rmi alpine:3.16 # remove alpine from local docker cache
-docker pull alpine:3.16
+docker rmi alpine:3.16.0 # remove alpine from local docker cache
+docker pull alpine:3.16.0
 ```
 
 You'll see this in the Pyrsia logs of node B:
@@ -386,7 +434,7 @@ to use the default port 7888 again to inspect the logs on node B, or you can run
 inspect-log without any changes to inspect the logs on node A:
 
 ```sh
-./pyrsia inspect-log docker --image alpine:3.16
+./pyrsia inspect-log docker --image alpine:3.16.0
 ```
 
 This CLI command returns the transparency logs for all the Pyrsia artifacts that

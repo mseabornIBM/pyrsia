@@ -6,10 +6,14 @@ EXPOSE 44000
 
 # Send logging to stdout and stderr
 ENV RUST_LOG=info
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYRSIA_BOOTDNS=boot.pyrsia.link
 
 RUN apt-get update; \
-    apt-get -y install ca-certificates wget gnupg2 jq curl; \
-    wget -O - https://pyrsia.io/install.sh | sh; 
+    apt-get -y install ca-certificates wget gnupg2 jq curl dnsutils; \
+    curl --fail https://pyrsia.io/install.sh -o ./install.sh; \
+    chmod 755 ./install.sh; \
+    ./install.sh; 
 
 # Need to run an entrypoint script that will determine if the docker container
 # is running under Kubernetes or not.  This is done to derive the external ip address

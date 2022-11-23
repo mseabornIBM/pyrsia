@@ -18,6 +18,7 @@ use crate::artifact_service::model::PackageType;
 use crate::blockchain_service::service::BlockchainService;
 use libp2p::PeerId;
 use log::{debug, error};
+use pyrsia_blockchain_network::error::BlockchainError;
 use rusqlite::types::{ToSqlOutput, Value};
 use rusqlite::{params, Connection, ToSql};
 use serde::{Deserialize, Serialize};
@@ -31,15 +32,26 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Error, Eq, PartialEq)]
+#[derive(Debug, Error)]
 pub enum TransparencyLogError {
+    #[error("TransparencyLog with ID {id} not found")]
+    LogNotFound { id: String },
     #[error(
-        "ID {package_specific_artifact_id} for type {package_type} not found in transparency log"
+        "Artifact ID {package_specific_artifact_id} for type {package_type} not found in transparency log"
     )]
-    NotFound {
+    ArtifactNotFound {
         package_type: PackageType,
         package_specific_artifact_id: String,
     },
+    #[error(
+        "Artifact ID {package_specific_id} for type {package_type} already exists in transparency log"
+    )]
+    ArtifactAlreadyExists {
+        package_type: PackageType,
+        package_specific_id: String,
+    },
+    #[error("Node with node ID {node_id} already exists in transparency log")]
+    NodeAlreadyExists { node_id: String },
     #[error("Hash Verification failed for ID {id}: {invalid_hash} vs {actual_hash}")]
     InvalidHash {
         id: String,
@@ -52,21 +64,11 @@ pub enum TransparencyLogError {
         invalid_operation: Operation,
     },
     #[error("Failure while accessing underlying storage: {0}")]
-    StorageFailure(String),
+    DatabaseFailure(#[from] rusqlite::Error),
+    #[error("Failure while accessing underlying storage: {0}")]
+    StorageFailure(#[from] io::Error),
     #[error("Failure while adding block to the blockchain: {0}")]
-    BlockchainFailure(String),
-}
-
-impl From<io::Error> for TransparencyLogError {
-    fn from(err: io::Error) -> TransparencyLogError {
-        TransparencyLogError::StorageFailure(err.to_string())
-    }
-}
-
-impl From<rusqlite::Error> for TransparencyLogError {
-    fn from(err: rusqlite::Error) -> TransparencyLogError {
-        TransparencyLogError::StorageFailure(err.to_string())
-    }
+    BlockchainFailure(#[from] BlockchainError),
 }
 
 #[derive(
@@ -94,7 +96,7 @@ impl ToSql for Operation {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct TransparencyLog {
-    id: String,
+    pub id: String,
     pub package_type: Option<PackageType>,
     pub package_specific_id: String,
     pub num_artifacts: u32,
@@ -105,7 +107,7 @@ pub struct TransparencyLog {
     source_id: String,
     timestamp: u64,
     pub operation: Operation,
-    node_id: String,
+    pub node_id: String,
     node_public_key: String,
 }
 
@@ -151,8 +153,36 @@ impl TransparencyLogService {
     }
 
     /// Add a new authorized node to the p2p network.
-    pub fn add_authorized_node(&self, _peer_id: PeerId) -> Result<(), TransparencyLogError> {
-        Ok(())
+    pub async fn add_authorized_node(&self, peer_id: PeerId) -> Result<(), TransparencyLogError> {
+        self.verify_node_can_be_added_to_transparency_logs(&peer_id.to_string())?;
+
+        let transparency_log = TransparencyLog {
+            id: Uuid::new_v4().to_string(),
+            package_type: None,
+            package_specific_id: String::from(""),
+            num_artifacts: 0,
+            package_specific_artifact_id: String::from(""),
+            artifact_hash: String::from(""),
+            source_hash: String::from(""),
+            artifact_id: String::from(""),
+            source_id: String::from(""),
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            operation: Operation::AddNode,
+            node_id: peer_id.to_string(),
+            node_public_key: Uuid::new_v4().to_string(),
+        };
+
+        let payload = serde_json::to_string(&transparency_log).unwrap();
+        self.blockchain_service
+            .lock()
+            .await
+            .add_payload(payload.into_bytes())
+            .await?;
+
+        self.write_transparency_log(&transparency_log)
     }
 
     /// Remove a known authorized node from the p2p network.
@@ -185,12 +215,11 @@ impl TransparencyLogService {
         };
 
         let payload = serde_json::to_string(&transparency_log).unwrap();
-        let _ = self
-            .blockchain_service
+        self.blockchain_service
             .lock()
             .await
             .add_payload(payload.into_bytes())
-            .await;
+            .await?;
 
         Ok(transparency_log)
     }
@@ -225,16 +254,73 @@ impl TransparencyLogService {
         self.read_transparency_logs(package_type, package_specific_id)
     }
 
+    /// Verifies that a specified package can be added to the transparency log database.
+    /// For that, the database should not contain the artifact yet, or if it does,
+    /// its latest operation is not RemoveArtifact. If that is not the case,
+    /// an ArtifactAlreadyExists error is returned
+    pub fn verify_package_can_be_added_to_transparency_logs(
+        &self,
+        package_type: &PackageType,
+        package_specific_id: &str,
+    ) -> Result<(), TransparencyLogError> {
+        let result = self.read_transparency_logs(package_type, package_specific_id);
+        match result.as_ref().ok().and(result.as_ref().unwrap().last()) {
+            None => {
+                // no logs or error, can be added
+                Ok(())
+            }
+            Some(t) => {
+                if t.operation == Operation::RemoveArtifact {
+                    // was removed, can be added
+                    Ok(())
+                } else {
+                    // the artifact exists, can't be added again
+                    Err(TransparencyLogError::ArtifactAlreadyExists {
+                        package_type: package_type.to_owned(),
+                        package_specific_id: package_specific_id.to_owned(),
+                    })
+                }
+            }
+        }
+    }
+
     /// Gets a list of transparency logs of which the operation is AddNode. Returns an error
     /// when no transparency log could be found.
     pub fn get_authorized_nodes(&self) -> Result<Vec<TransparencyLog>, TransparencyLogError> {
         self.find_added_nodes()
     }
 
+    /// Verifies that a specified node can be added to the transparency log database.
+    /// For that, the database should not contain the node yet. If that is not the case,
+    /// an NodeAlreadyExists error is returned
+    pub fn verify_node_can_be_added_to_transparency_logs(
+        &self,
+        peer_id: &str,
+    ) -> Result<(), TransparencyLogError> {
+        match self.get_authorized_nodes().ok() {
+            None => {
+                // error, can be added
+                Ok(())
+            }
+            Some(logs) => {
+                for log in logs {
+                    if log.node_id == *peer_id {
+                        return Err(TransparencyLogError::NodeAlreadyExists {
+                            node_id: peer_id.to_owned(),
+                        });
+                    }
+                }
+                // was removed, can be added
+                Ok(())
+            }
+        }
+    }
+
     fn open_db(&self) -> Result<Connection, TransparencyLogError> {
-        fs::create_dir_all(&self.storage_path)?;
-        let db_storage_path = self.storage_path.to_str().unwrap();
-        let conn = Connection::open(db_storage_path.to_owned() + "/transparency_log.db")?;
+        let mut db_path = self.storage_path.to_owned();
+        fs::create_dir_all(db_path.clone())?;
+        db_path.push("transparency_log.db");
+        let conn = Connection::open(db_path)?;
         match conn.execute(
             "CREATE TABLE IF NOT EXISTS TRANSPARENCYLOG (
                 id TEXT PRIMARY KEY,
@@ -258,6 +344,18 @@ impl TransparencyLogService {
                 debug!("Error creating transparency log database table: {:?}", err);
                 Err(err.into())
             }
+        }
+    }
+
+    pub fn find_transparency_log(&self, id: &str) -> Result<TransparencyLog, TransparencyLogError> {
+        let query = ["SELECT * FROM TRANSPARENCYLOG WHERE id = '", id, "';"];
+
+        let results = self.process_query(query.join("").as_str())?;
+
+        if results.len() == 1 {
+            Ok(results.into_iter().next().unwrap())
+        } else {
+            Err(TransparencyLogError::LogNotFound { id: id.to_owned() })
         }
     }
 
@@ -321,13 +419,14 @@ impl TransparencyLogService {
 
         vector.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
 
-        let latest_record = vector
-            .into_iter()
-            .next()
-            .ok_or(TransparencyLogError::NotFound {
-                package_type: *package_type,
-                package_specific_artifact_id: package_specific_artifact_id.to_owned(),
-            })?;
+        let latest_record =
+            vector
+                .into_iter()
+                .next()
+                .ok_or(TransparencyLogError::ArtifactNotFound {
+                    package_type: *package_type,
+                    package_specific_artifact_id: package_specific_artifact_id.to_owned(),
+                })?;
 
         if latest_record.operation == Operation::RemoveArtifact {
             return Err(TransparencyLogError::InvalidOperation {
@@ -443,6 +542,7 @@ mod tests {
     use super::*;
     use crate::{network::client::Client, util::test_util};
     use libp2p::identity;
+    use libp2p::identity::Keypair;
     use tokio::sync::mpsc;
 
     fn create_p2p_client(keypair: identity::Keypair) -> Client {
@@ -453,16 +553,23 @@ mod tests {
         }
     }
 
-    fn create_transparency_log_service<P: AsRef<Path>>(artifact_path: P) -> TransparencyLogService {
+    async fn create_transparency_log_service(
+        artifact_path: impl AsRef<Path>,
+    ) -> TransparencyLogService {
         let ed25519_keypair = identity::ed25519::Keypair::generate();
         let p2p_client = create_p2p_client(identity::Keypair::Ed25519(ed25519_keypair.clone()));
 
-        let blockchain_service = Arc::new(Mutex::new(BlockchainService::new(
+        let blockchain_service = BlockchainService::init_first_blockchain_node(
+            &ed25519_keypair,
             &ed25519_keypair,
             p2p_client,
-        )));
+            &artifact_path,
+        )
+        .await
+        .expect("Creating BlockchainService failed");
 
-        TransparencyLogService::new(&artifact_path, blockchain_service).unwrap()
+        TransparencyLogService::new(artifact_path, Arc::new(Mutex::new(blockchain_service)))
+            .unwrap()
     }
 
     #[test]
@@ -514,11 +621,11 @@ mod tests {
         assert_eq!(transparency_log.node_public_key, node_public_key);
     }
 
-    #[test]
-    fn test_open_db() {
+    #[tokio::test]
+    async fn test_open_db() {
         let tmp_dir = test_util::tests::setup();
 
-        let log = create_transparency_log_service(&tmp_dir);
+        let log = create_transparency_log_service(&tmp_dir).await;
 
         let result = log.open_db();
         assert!(result.is_ok());
@@ -528,14 +635,17 @@ mod tests {
         path.push("transparency_log.db");
         assert_eq!(conn.path().unwrap(), path.as_path());
 
+        let close_result = conn.close();
+        assert!(close_result.is_ok());
+
         test_util::tests::teardown(tmp_dir);
     }
 
-    #[test]
-    fn test_write_tranparency_log() {
+    #[tokio::test]
+    async fn test_write_tranparency_log() {
         let tmp_dir = test_util::tests::setup();
 
-        let log = create_transparency_log_service(&tmp_dir);
+        let log = create_transparency_log_service(&tmp_dir).await;
 
         let transparency_log = TransparencyLog {
             id: String::from("id"),
@@ -559,11 +669,11 @@ mod tests {
         test_util::tests::teardown(tmp_dir);
     }
 
-    #[test]
-    fn test_write_twice_transparency_log_error() {
+    #[tokio::test]
+    async fn test_write_twice_transparency_log_error() {
         let tmp_dir = test_util::tests::setup();
 
-        let log = create_transparency_log_service(&tmp_dir);
+        let log = create_transparency_log_service(&tmp_dir).await;
 
         let transparency_log = TransparencyLog {
             id: String::from("id"),
@@ -589,11 +699,82 @@ mod tests {
         test_util::tests::teardown(tmp_dir);
     }
 
-    #[test]
-    fn test_read_transparency_log() {
+    #[tokio::test]
+    async fn test_find_transparency_log() {
         let tmp_dir = test_util::tests::setup();
 
-        let log = create_transparency_log_service(&tmp_dir);
+        let log = create_transparency_log_service(&tmp_dir).await;
+
+        let transparency_log = TransparencyLog {
+            id: String::from("id"),
+            package_type: Some(PackageType::Maven2),
+            package_specific_id: String::from("package_specific_id"),
+            num_artifacts: 8,
+            package_specific_artifact_id: String::from("package_specific_artifact_id"),
+            artifact_hash: String::from("artifact_hash"),
+            source_hash: String::from("source_hash"),
+            artifact_id: Uuid::new_v4().to_string(),
+            source_id: Uuid::new_v4().to_string(),
+            timestamp: 1234567890,
+            operation: Operation::AddArtifact,
+            node_id: Uuid::new_v4().to_string(),
+            node_public_key: Uuid::new_v4().to_string(),
+        };
+
+        let result_write = log.write_transparency_log(&transparency_log);
+        assert!(result_write.is_ok());
+
+        let result_find = log.find_transparency_log("id");
+        assert!(result_find.is_ok());
+
+        test_util::tests::teardown(tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_find_transparency_log_not_found() {
+        let tmp_dir = test_util::tests::setup();
+
+        let log = create_transparency_log_service(&tmp_dir).await;
+
+        let transparency_log = TransparencyLog {
+            id: String::from("id"),
+            package_type: Some(PackageType::Maven2),
+            package_specific_id: String::from("package_specific_id"),
+            num_artifacts: 8,
+            package_specific_artifact_id: String::from("package_specific_artifact_id"),
+            artifact_hash: String::from("artifact_hash"),
+            source_hash: String::from("source_hash"),
+            artifact_id: Uuid::new_v4().to_string(),
+            source_id: Uuid::new_v4().to_string(),
+            timestamp: 1234567890,
+            operation: Operation::AddArtifact,
+            node_id: Uuid::new_v4().to_string(),
+            node_public_key: Uuid::new_v4().to_string(),
+        };
+
+        let result_write = log.write_transparency_log(&transparency_log);
+        assert!(result_write.is_ok());
+
+        let find_error = log
+            .find_transparency_log("unknown_id")
+            .expect_err("Find transparency log should have failed.");
+        match find_error {
+            TransparencyLogError::LogNotFound { id } => {
+                assert_eq!("unknown_id".to_owned(), id);
+            }
+            e => {
+                panic!("Invalid Error encountered: {:?}", e);
+            }
+        }
+
+        test_util::tests::teardown(tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_read_transparency_log() {
+        let tmp_dir = test_util::tests::setup();
+
+        let log = create_transparency_log_service(&tmp_dir).await;
 
         let transparency_log = TransparencyLog {
             id: String::from("id"),
@@ -621,11 +802,11 @@ mod tests {
         test_util::tests::teardown(tmp_dir);
     }
 
-    #[test]
-    fn test_read_transparency_log_invalid_id() {
+    #[tokio::test]
+    async fn test_read_transparency_log_invalid_id() {
         let tmp_dir = test_util::tests::setup();
 
-        let log = create_transparency_log_service(&tmp_dir);
+        let log = create_transparency_log_service(&tmp_dir).await;
 
         let transparency_log = TransparencyLog {
             id: String::from("id"),
@@ -651,7 +832,7 @@ mod tests {
         assert!(result_read.is_err());
         assert_eq!(
             result_read.err().unwrap().to_string(),
-            TransparencyLogError::NotFound {
+            TransparencyLogError::ArtifactNotFound {
                 package_type: PackageType::Maven2,
                 package_specific_artifact_id: String::from("invalid_package_specific_artifact_id"),
             }
@@ -661,11 +842,11 @@ mod tests {
         test_util::tests::teardown(tmp_dir);
     }
 
-    #[test]
-    fn test_read_latest_transparency_log() {
+    #[tokio::test]
+    async fn test_read_latest_transparency_log() {
         let tmp_dir = test_util::tests::setup();
 
-        let log = create_transparency_log_service(&tmp_dir);
+        let log = create_transparency_log_service(&tmp_dir).await;
 
         let transparency_log1 = TransparencyLog {
             id: String::from("id1"),
@@ -712,11 +893,11 @@ mod tests {
         test_util::tests::teardown(tmp_dir);
     }
 
-    #[test]
-    fn test_read_transparency_logs() {
+    #[tokio::test]
+    async fn test_read_transparency_logs() {
         let tmp_dir = test_util::tests::setup();
 
-        let log = create_transparency_log_service(&tmp_dir);
+        let log = create_transparency_log_service(&tmp_dir).await;
 
         let transparency_log1 = TransparencyLog {
             id: String::from("id1"),
@@ -768,11 +949,82 @@ mod tests {
         test_util::tests::teardown(tmp_dir);
     }
 
-    #[test]
-    fn test_read_remove_artifact_transparency_log() {
+    #[tokio::test]
+    async fn test_verify_artifact_can_be_added_to_transparency_logs() {
         let tmp_dir = test_util::tests::setup();
 
-        let log = create_transparency_log_service(&tmp_dir);
+        let log = create_transparency_log_service(&tmp_dir).await;
+        let result1 = log.verify_package_can_be_added_to_transparency_logs(
+            &PackageType::Docker,
+            "package_specific_id",
+        );
+        assert!(result1.is_ok());
+
+        let transparency_log1 = TransparencyLog {
+            id: String::from("id1"),
+            package_type: Some(PackageType::Docker),
+            package_specific_id: String::from("package_specific_id"),
+            num_artifacts: 8,
+            package_specific_artifact_id: String::from("package_specific_artifact_id"),
+            artifact_hash: String::from("artifact_hash1"),
+            source_hash: String::from("source_hash1"),
+            artifact_id: Uuid::new_v4().to_string(),
+            source_id: Uuid::new_v4().to_string(),
+            timestamp: 10000000,
+            operation: Operation::AddArtifact,
+            node_id: Uuid::new_v4().to_string(),
+            node_public_key: Uuid::new_v4().to_string(),
+        };
+        let result_write1 = log.write_transparency_log(&transparency_log1);
+        assert!(result_write1.is_ok());
+
+        let result2 = log.verify_package_can_be_added_to_transparency_logs(
+            &PackageType::Docker,
+            "package_specific_id",
+        );
+        assert!(result2.is_err());
+        assert_eq!(
+            result2.err().unwrap().to_string(),
+            TransparencyLogError::ArtifactAlreadyExists {
+                package_type: PackageType::Docker,
+                package_specific_id: String::from("package_specific_id"),
+            }
+            .to_string()
+        );
+
+        let transparency_log2 = TransparencyLog {
+            id: String::from("id2"),
+            package_type: Some(PackageType::Docker),
+            package_specific_id: String::from("package_specific_id"),
+            num_artifacts: 8,
+            package_specific_artifact_id: String::from("package_specific_artifact_id"),
+            artifact_hash: String::from("artifact_hash1"),
+            source_hash: String::from("source_hash1"),
+            artifact_id: Uuid::new_v4().to_string(),
+            source_id: Uuid::new_v4().to_string(),
+            timestamp: 20000000,
+            operation: Operation::RemoveArtifact,
+            node_id: Uuid::new_v4().to_string(),
+            node_public_key: Uuid::new_v4().to_string(),
+        };
+
+        let result_write2 = log.write_transparency_log(&transparency_log2);
+        assert!(result_write2.is_ok());
+
+        let result3 = log.verify_package_can_be_added_to_transparency_logs(
+            &PackageType::Docker,
+            "package_specific_id",
+        );
+        assert!(result3.is_ok());
+
+        test_util::tests::teardown(tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_read_remove_artifact_transparency_log() {
+        let tmp_dir = test_util::tests::setup();
+
+        let log = create_transparency_log_service(&tmp_dir).await;
 
         let transparency_log = TransparencyLog {
             id: String::from("id"),
@@ -812,7 +1064,7 @@ mod tests {
     async fn test_add_artifact() {
         let tmp_dir = test_util::tests::setup();
 
-        let mut log = create_transparency_log_service(&tmp_dir);
+        let mut log = create_transparency_log_service(&tmp_dir).await;
 
         let result = log
             .add_artifact(AddArtifactRequest {
@@ -828,11 +1080,11 @@ mod tests {
         test_util::tests::teardown(tmp_dir);
     }
 
-    #[test]
-    fn test_get_authorized_nodes_empty() {
+    #[tokio::test]
+    async fn test_get_authorized_nodes_empty() {
         let tmp_dir = test_util::tests::setup();
 
-        let log = create_transparency_log_service(&tmp_dir);
+        let log = create_transparency_log_service(&tmp_dir).await;
 
         let result_read = log.get_authorized_nodes();
         assert!(result_read.is_ok());
@@ -841,11 +1093,47 @@ mod tests {
         test_util::tests::teardown(tmp_dir);
     }
 
-    #[test]
-    fn test_get_authorized_nodes_add() {
+    #[tokio::test]
+    async fn test_add_authorized_nodes() {
         let tmp_dir = test_util::tests::setup();
 
-        let log = create_transparency_log_service(&tmp_dir);
+        let log = create_transparency_log_service(&tmp_dir).await;
+
+        let peer_id = Keypair::generate_ed25519().public().to_peer_id();
+
+        let transparency_log = TransparencyLog {
+            id: String::from("id"),
+            package_type: None,
+            package_specific_id: String::from(""),
+            num_artifacts: 0,
+            package_specific_artifact_id: String::from(""),
+            artifact_hash: String::from(""),
+            source_hash: String::from(""),
+            artifact_id: String::from(""),
+            source_id: String::from(""),
+            timestamp: 10000000,
+            operation: Operation::AddNode,
+            node_id: peer_id.clone().to_string(),
+            node_public_key: Uuid::new_v4().to_string(),
+        };
+
+        let result_add = log.add_authorized_node(peer_id).await;
+        assert!(result_add.is_ok());
+
+        let result_read = log.get_authorized_nodes();
+        assert!(result_read.is_ok());
+        let vec = result_read.unwrap();
+        assert_eq!(vec.len(), 1);
+        assert_eq!(vec.get(0).unwrap().node_id, transparency_log.node_id);
+
+        test_util::tests::teardown(tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_get_authorized_nodes_add() {
+        let tmp_dir = test_util::tests::setup();
+
+        let log = create_transparency_log_service(&tmp_dir).await;
 
         let transparency_log = TransparencyLog {
             id: String::from("id"),
@@ -875,11 +1163,11 @@ mod tests {
         test_util::tests::teardown(tmp_dir);
     }
 
-    #[test]
-    fn test_get_authorized_nodes_add_and_remove() {
+    #[tokio::test]
+    async fn test_get_authorized_nodes_add_and_remove() {
         let tmp_dir = test_util::tests::setup();
 
-        let log = create_transparency_log_service(&tmp_dir);
+        let log = create_transparency_log_service(&tmp_dir).await;
 
         let transparency_log1 = TransparencyLog {
             id: String::from("id1"),
@@ -943,6 +1231,69 @@ mod tests {
         let vec = result_read.unwrap();
         assert_eq!(vec.len(), 1);
         assert_eq!(vec.get(0).unwrap().node_id, "node_id2");
+
+        test_util::tests::teardown(tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_verify_authorized_node_can_be_added() {
+        let tmp_dir = test_util::tests::setup();
+
+        let log = create_transparency_log_service(&tmp_dir).await;
+
+        let result1 = log.verify_node_can_be_added_to_transparency_logs("node_id1");
+        assert!(result1.is_ok());
+
+        let transparency_log1 = TransparencyLog {
+            id: String::from("id1"),
+            package_type: None,
+            package_specific_id: String::from(""),
+            num_artifacts: 8,
+            package_specific_artifact_id: String::from(""),
+            artifact_hash: String::from(""),
+            source_hash: String::from(""),
+            artifact_id: String::from(""),
+            source_id: String::from(""),
+            timestamp: 10000000,
+            operation: Operation::AddNode,
+            node_id: String::from("node_id1"),
+            node_public_key: Uuid::new_v4().to_string(),
+        };
+
+        let result_write1 = log.write_transparency_log(&transparency_log1);
+        assert!(result_write1.is_ok());
+
+        let result2 = log.verify_node_can_be_added_to_transparency_logs("node_id1");
+        assert!(result2.is_err());
+        assert_eq!(
+            result2.err().unwrap().to_string(),
+            TransparencyLogError::NodeAlreadyExists {
+                node_id: String::from("node_id1"),
+            }
+            .to_string()
+        );
+
+        let transparency_log3 = TransparencyLog {
+            id: String::from("id2"),
+            package_type: None,
+            package_specific_id: String::from(""),
+            num_artifacts: 8,
+            package_specific_artifact_id: String::from(""),
+            artifact_hash: String::from(""),
+            source_hash: String::from(""),
+            artifact_id: String::from(""),
+            source_id: String::from(""),
+            timestamp: 20000000,
+            operation: Operation::RemoveNode,
+            node_id: String::from("node_id1"),
+            node_public_key: Uuid::new_v4().to_string(),
+        };
+
+        let result_write2 = log.write_transparency_log(&transparency_log3);
+        assert!(result_write2.is_ok());
+
+        let result3 = log.verify_node_can_be_added_to_transparency_logs("node_id1");
+        assert!(result3.is_ok());
 
         test_util::tests::teardown(tmp_dir);
     }

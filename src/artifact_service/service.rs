@@ -24,13 +24,15 @@ use crate::transparency_log::log::{
     AddArtifactRequest, TransparencyLog, TransparencyLogError, TransparencyLogService,
 };
 use anyhow::{bail, Context};
+use itertools::Itertools;
 use libp2p::PeerId;
-use log::info;
+use log::{debug, info, warn};
 use multihash::Hasher;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
 use std::str;
+use std::str::FromStr;
 
 /// The artifact service is the component that handles everything related to
 /// pyrsia artifacts. It allows artifacts to be retrieved and added to the
@@ -64,9 +66,59 @@ impl ArtifactService {
         package_type: PackageType,
         package_specific_id: String,
     ) -> Result<String, BuildError> {
-        self.build_event_client
-            .start_build(package_type, package_specific_id)
-            .await
+        debug!(
+            "Request build of {:?} {:?}",
+            package_type, package_specific_id
+        );
+
+        let local_peer_id = self.p2p_client.local_peer_id;
+        debug!("Got local node with peer_id: {:?}", local_peer_id.clone());
+
+        let nodes = self
+            .transparency_log_service
+            .get_authorized_nodes()
+            .map_err(|e| BuildError::InitializationFailed(e.to_string()))?;
+
+        if nodes.is_empty() {
+            warn!("No authorized nodes found");
+            return Err(BuildError::InitializationFailed(String::from(
+                "No authorized nodes found",
+            )));
+        }
+
+        let peer_id = match nodes
+            .iter()
+            .map(|node| PeerId::from_str(&node.node_id).unwrap())
+            .find_or_last(|&auth_peer_id| local_peer_id.eq(&auth_peer_id))
+        {
+            Some(auth_peer_id) => {
+                debug!(
+                    "Got authorized node with peer_id: {:?}",
+                    auth_peer_id.clone()
+                );
+                auth_peer_id
+            }
+            None => panic!("Error unexpected looking for authorized nodes"),
+        };
+
+        // prevent duplicated builds
+        self.transparency_log_service
+            .verify_package_can_be_added_to_transparency_logs(&package_type, &package_specific_id)
+            .map_err(|t| BuildError::ArtifactAlreadyExists(format!("{:?}", t)))?;
+
+        if local_peer_id.eq(&peer_id) {
+            debug!("Start local build in authorized node");
+            self.build_event_client
+                .start_build(package_type, package_specific_id)
+                .await
+        } else {
+            debug!("Request build in authorized node from p2p network");
+            self.p2p_client
+                .clone()
+                .request_build(&peer_id, package_type, package_specific_id.clone())
+                .await
+                .map_err(|e| BuildError::InitializationFailed(e.to_string()))
+        }
     }
 
     pub async fn handle_build_result(
@@ -127,8 +179,13 @@ impl ArtifactService {
     ) -> Result<(), anyhow::Error> {
         if payloads.len() == 1 {
             let transparency_log: TransparencyLog = serde_json::from_slice(&payloads[0])?;
-            self.transparency_log_service
-                .write_transparency_log(&transparency_log)?;
+            if let Err(TransparencyLogError::LogNotFound { .. }) = self
+                .transparency_log_service
+                .find_transparency_log(&transparency_log.id)
+            {
+                self.transparency_log_service
+                    .write_transparency_log(&transparency_log)?;
+            }
         }
 
         Ok(())
@@ -180,6 +237,29 @@ impl ArtifactService {
         Ok(artifact)
     }
 
+    /// Retrieve the artifact data for the specified package. If the artifact
+    /// is not found, the service start a request to build it on an authorized
+    /// node.
+    pub async fn get_artifact_or_build(
+        &mut self,
+        package_type: PackageType,
+        package_specific_id: &str,
+        package_specific_artifact_id: &str,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.get_artifact(package_type, package_specific_artifact_id).await.map_err(|e| {
+                warn!("Error looking for artifact: {:?}. A new build will be started. Try again later", e);
+                let new_artifact_service = self.clone();
+                let new_package_specific_id = package_specific_id.to_string();
+                tokio::spawn(async move {
+                    debug!("Spawning a build...");
+                    let build_result = new_artifact_service.clone().request_build(package_type, new_package_specific_id).await;
+                    debug!("Build result {:?}", build_result);
+                });
+                // in any case, return the error
+                e
+            })
+    }
+
     /// Retrieve the artifact data specified by `artifact_id` from the local storage.
     pub async fn get_artifact_locally(
         &mut self,
@@ -203,6 +283,19 @@ impl ArtifactService {
             .search_transparency_logs(&package_type, package_specific_id)?;
 
         Ok(transparency_logs)
+    }
+
+    pub async fn provide_local_artifacts(&self) -> anyhow::Result<()> {
+        for path in self.artifact_storage.list_artifacts()? {
+            if let Some(artifact_id) = path.file_stem() {
+                debug!("Providing artifact_id: {:?}", artifact_id);
+                self.p2p_client
+                    .clone()
+                    .provide(artifact_id.to_str().expect("error getting artifact_id"))
+                    .await?
+            }
+        }
+        Ok(())
     }
 
     async fn get_artifact_from_peers(
@@ -294,18 +387,22 @@ mod tests {
         (command_receiver, p2p_client)
     }
 
-    fn create_artifact_service<P: AsRef<Path>>(
-        artifact_path: P,
+    async fn create_artifact_service(
+        artifact_path: impl AsRef<Path>,
         keypair: &Keypair,
         p2p_client: Client,
     ) -> (mpsc::Receiver<BuildEvent>, ArtifactService) {
-        let blockchain_service = Arc::new(Mutex::new(BlockchainService::new(
+        let blockchain_service = BlockchainService::init_first_blockchain_node(
+            keypair,
             keypair,
             p2p_client.clone(),
-        )));
+            &artifact_path,
+        )
+        .await
+        .expect("Creating BlockchainService failed");
 
         let transparency_log_service =
-            TransparencyLogService::new(&artifact_path, blockchain_service)
+            TransparencyLogService::new(&artifact_path, Arc::new(Mutex::new(blockchain_service)))
                 .expect("Creating TransparencyLogService failed");
 
         let (build_event_sender, build_event_receiver) = mpsc::channel(1);
@@ -330,7 +427,7 @@ mod tests {
 
         let (mut command_receiver, p2p_client) = create_p2p_client(&keypair);
         let (_build_event_receiver, mut artifact_service) =
-            create_artifact_service(&tmp_dir, &keypair, p2p_client.clone());
+            create_artifact_service(&tmp_dir, &keypair, p2p_client.clone()).await;
 
         tokio::spawn(async move {
             loop {
@@ -393,6 +490,71 @@ mod tests {
         test_util::tests::teardown(tmp_dir);
     }
 
+    #[tokio::test]
+    async fn test_put_and_list_artifact() {
+        let tmp_dir = test_util::tests::setup();
+
+        let keypair = Keypair::generate();
+
+        let (mut command_receiver, p2p_client) = create_p2p_client(&keypair);
+        let (_build_event_receiver, mut artifact_service) =
+            create_artifact_service(&tmp_dir, &keypair, p2p_client.clone()).await;
+
+        tokio::spawn(async move {
+            loop {
+                match command_receiver.recv().await {
+                    Some(Command::ListPeers { sender, .. }) => {
+                        let _ = sender.send(HashSet::new());
+                    }
+                    Some(Command::Provide { sender, .. }) => {
+                        let _ = sender.send(());
+                    }
+                    _ => panic!("Command must match Command::ListPeers"),
+                }
+            }
+        });
+
+        let package_type = PackageType::Docker;
+        let package_specific_id = "package_specific_id";
+        let package_specific_artifact_id = "package_specific_artifact_id";
+        let transparency_log = artifact_service
+            .transparency_log_service
+            .add_artifact(AddArtifactRequest {
+                package_type,
+                package_specific_id: package_specific_id.to_owned(),
+                num_artifacts: 8,
+                package_specific_artifact_id: package_specific_artifact_id.to_owned(),
+                artifact_hash: hex::encode(VALID_ARTIFACT_HASH),
+            })
+            .await
+            .unwrap();
+        artifact_service
+            .transparency_log_service
+            .write_transparency_log(&transparency_log)
+            .unwrap();
+
+        //put the artifact
+        artifact_service
+            .put_artifact(
+                &transparency_log.artifact_id,
+                &mut get_file_reader().unwrap(),
+            )
+            .context("Error from put_artifact")
+            .unwrap();
+
+        // provide artifacts
+        let future = {
+            artifact_service
+                .provide_local_artifacts()
+                .await
+                .context("Error from provide_local_artifacts")
+        };
+        let files = task::spawn_blocking(|| future).await.unwrap();
+        assert!(files.is_ok());
+
+        test_util::tests::teardown(tmp_dir);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_get_from_peers() {
         let tmp_dir = test_util::tests::setup();
@@ -401,7 +563,7 @@ mod tests {
 
         let (mut command_receiver, p2p_client) = create_p2p_client(&keypair);
         let (_build_event_receiver, mut artifact_service) =
-            create_artifact_service(&tmp_dir, &keypair, p2p_client.clone());
+            create_artifact_service(&tmp_dir, &keypair, p2p_client.clone()).await;
 
         tokio::spawn(async move {
             loop {
@@ -469,7 +631,7 @@ mod tests {
 
         let (mut command_receiver, p2p_client) = create_p2p_client(&keypair);
         let (_build_event_receiver, mut artifact_service) =
-            create_artifact_service(&tmp_dir, &keypair, p2p_client.clone());
+            create_artifact_service(&tmp_dir, &keypair, p2p_client.clone()).await;
 
         tokio::spawn(async move {
             tokio::select! {
@@ -504,7 +666,7 @@ mod tests {
 
         let (mut command_receiver, p2p_client) = create_p2p_client(&keypair);
         let (_build_event_receiver, mut artifact_service) =
-            create_artifact_service(&tmp_dir, &keypair, p2p_client.clone());
+            create_artifact_service(&tmp_dir, &keypair, p2p_client.clone()).await;
 
         tokio::spawn(async move {
             loop {
@@ -561,7 +723,7 @@ mod tests {
 
         let (mut command_receiver, p2p_client) = create_p2p_client(&keypair);
         let (_build_event_receiver, mut artifact_service) =
-            create_artifact_service(&tmp_dir, &keypair, p2p_client.clone());
+            create_artifact_service(&tmp_dir, &keypair, p2p_client.clone()).await;
 
         tokio::spawn(async move {
             loop {
@@ -606,18 +768,24 @@ mod tests {
             .get_artifact(&package_type, package_specific_artifact_id)
             .unwrap();
 
-        let result = artifact_service
+        let verify_error = artifact_service
             .verify_artifact(&transparency_log, b"OTHER_SAMPLE_DATA")
-            .await;
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err(),
+            .await
+            .expect_err("Verify artifact should have failed.");
+        match verify_error {
             TransparencyLogError::InvalidHash {
-                id: package_specific_artifact_id.to_string(),
-                invalid_hash: random_other_hash,
-                actual_hash: random_hash
+                id,
+                invalid_hash,
+                actual_hash,
+            } => {
+                assert_eq!(id, package_specific_artifact_id.to_string());
+                assert_eq!(invalid_hash, random_other_hash);
+                assert_eq!(actual_hash, random_hash);
             }
-        );
+            e => {
+                panic!("Invalid Error encountered: {:?}", e);
+            }
+        }
 
         test_util::tests::teardown(tmp_dir);
     }
@@ -630,7 +798,7 @@ mod tests {
 
         let (mut command_receiver, p2p_client) = create_p2p_client(&keypair);
         let (_build_event_receiver, mut artifact_service) =
-            create_artifact_service(&tmp_dir, &keypair, p2p_client.clone());
+            create_artifact_service(&tmp_dir, &keypair, p2p_client.clone()).await;
 
         tokio::spawn(async move {
             loop {
@@ -671,6 +839,134 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 1);
+
+        test_util::tests::teardown(tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_request_build_without_authorized_nodes() {
+        let tmp_dir = test_util::tests::setup();
+
+        let keypair = Keypair::generate();
+
+        let (_command_receiver, p2p_client) = create_p2p_client(&keypair);
+        let (_build_event_receiver, artifact_service) =
+            create_artifact_service(&tmp_dir, &keypair, p2p_client.clone()).await;
+
+        let package_type = PackageType::Docker;
+        let package_specific_id = "package_specific_id";
+
+        // request build
+        let error = artifact_service
+            .request_build(package_type, package_specific_id.to_string())
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            BuildError::InitializationFailed("No authorized nodes found".to_owned())
+        );
+
+        test_util::tests::teardown(tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_request_build_starts_on_local_authorized_node() {
+        let tmp_dir = test_util::tests::setup();
+
+        let keypair = Keypair::generate();
+
+        let (mut command_receiver, p2p_client) = create_p2p_client(&keypair);
+        let (mut build_event_receiver, artifact_service) =
+            create_artifact_service(&tmp_dir, &keypair, p2p_client.clone()).await;
+
+        tokio::spawn(async move {
+            loop {
+                match command_receiver.recv().await {
+                    Some(Command::ListPeers { sender, .. }) => {
+                        let _ = sender.send(HashSet::new());
+                    }
+                    _ => panic!("Command must match Command::ListPeers"),
+                }
+            }
+        });
+
+        tokio::spawn(async move {
+            loop {
+                match build_event_receiver.recv().await {
+                    Some(BuildEvent::Start { sender, .. }) => {
+                        let _ = sender.send(Ok(String::from("build_start_ok")));
+                    }
+                    _ => panic!("BuildEvent must match BuildEvent::Start"),
+                }
+            }
+        });
+
+        artifact_service
+            .transparency_log_service
+            .add_authorized_node(p2p_client.local_peer_id)
+            .await
+            .unwrap();
+
+        let package_type = PackageType::Docker;
+        let package_specific_id = "package_specific_id";
+
+        // request build
+        let result = artifact_service
+            .request_build(package_type, package_specific_id.to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(result, String::from("build_start_ok"));
+
+        test_util::tests::teardown(tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_request_build_starts_on_other_authorized_node() {
+        let tmp_dir = test_util::tests::setup();
+
+        let keypair = Keypair::generate();
+
+        let (mut command_receiver, p2p_client) = create_p2p_client(&keypair);
+        let (_build_event_receiver, artifact_service) =
+            create_artifact_service(&tmp_dir, &keypair, p2p_client.clone()).await;
+
+        tokio::spawn(async move {
+            loop {
+                match command_receiver.recv().await {
+                    Some(Command::ListPeers { sender, .. }) => {
+                        let _ = sender.send(HashSet::new());
+                    }
+                    Some(Command::RequestBuild { sender, .. }) => {
+                        let _ = sender.send(Ok(String::from("request_build_ok")));
+                    }
+                    other => panic!(
+                        "Command must match Command::ListPeers or Command::RequestBuild, was: {:?}",
+                        other
+                    ),
+                }
+            }
+        });
+
+        let other_peer_id = PublicKey::Ed25519(Keypair::generate().public()).to_peer_id();
+
+        artifact_service
+            .transparency_log_service
+            .add_authorized_node(other_peer_id)
+            .await
+            .unwrap();
+
+        let package_type = PackageType::Docker;
+        let package_specific_id = "package_specific_id";
+
+        // request build
+        let result = artifact_service
+            .request_build(package_type, package_specific_id.to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(result, String::from("request_build_ok"));
 
         test_util::tests::teardown(tmp_dir);
     }

@@ -15,23 +15,48 @@
 */
 
 use crate::artifact_service::model::PackageType;
-use crate::build_service::event::BuildEventClient;
-use crate::docker::error_util::RegistryError;
+use crate::docker::error_util::{RegistryError, RegistryErrorCode};
 use crate::network::client::Client;
 use crate::node_api::model::cli::{
-    RequestDockerBuild, RequestDockerLog, RequestMavenBuild, RequestMavenLog,
+    RequestAddAuthorizedNode, RequestDockerBuild, RequestDockerLog, RequestMavenBuild,
+    RequestMavenLog,
 };
 use crate::transparency_log::log::TransparencyLogService;
 
+use crate::artifact_service::service::ArtifactService;
+use libp2p::PeerId;
 use log::debug;
+use std::str::FromStr;
 use warp::{http::StatusCode, Rejection, Reply};
+
+pub async fn handle_add_authorized_node(
+    request_add_authorized_node: RequestAddAuthorizedNode,
+    transparency_log_service: TransparencyLogService,
+) -> Result<impl Reply, Rejection> {
+    let peer_id =
+        PeerId::from_str(&request_add_authorized_node.peer_id).map_err(|_| RegistryError {
+            code: RegistryErrorCode::BadRequest(format!(
+                "PeerId has invalid format: {}",
+                request_add_authorized_node.peer_id
+            )),
+        })?;
+
+    transparency_log_service
+        .add_authorized_node(peer_id)
+        .await
+        .map_err(RegistryError::from)?;
+
+    Ok(warp::http::response::Builder::new()
+        .status(StatusCode::CREATED)
+        .body(""))
+}
 
 pub async fn handle_build_docker(
     request_docker_build: RequestDockerBuild,
-    build_event_client: BuildEventClient,
+    artifact_service: ArtifactService,
 ) -> Result<impl Reply, Rejection> {
-    let build_id = build_event_client
-        .start_build(PackageType::Docker, request_docker_build.image)
+    let build_id = artifact_service
+        .request_build(PackageType::Docker, request_docker_build.image)
         .await
         .map_err(RegistryError::from)?;
 
@@ -45,10 +70,10 @@ pub async fn handle_build_docker(
 
 pub async fn handle_build_maven(
     request_maven_build: RequestMavenBuild,
-    build_event_client: BuildEventClient,
+    artifact_service: ArtifactService,
 ) -> Result<impl Reply, Rejection> {
-    let build_id = build_event_client
-        .start_build(PackageType::Maven2, request_maven_build.gav)
+    let build_id = artifact_service
+        .request_build(PackageType::Maven2, request_maven_build.gav)
         .await
         .map_err(RegistryError::from)?;
 

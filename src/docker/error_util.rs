@@ -39,6 +39,7 @@ pub enum RegistryErrorCode {
     BlobUnknown,
     BlobDoesNotExist(String),
     ManifestUnknown,
+    BadRequest(String),
     Unknown(String),
 }
 
@@ -57,16 +58,26 @@ impl From<anyhow::Error> for RegistryError {
 
 impl From<BuildError> for RegistryError {
     fn from(err: BuildError) -> RegistryError {
-        RegistryError {
-            code: RegistryErrorCode::Unknown(err.to_string()),
+        match err {
+            BuildError::ArtifactAlreadyExists(_) => RegistryError {
+                code: RegistryErrorCode::BadRequest(err.to_string()),
+            },
+            _ => RegistryError {
+                code: RegistryErrorCode::Unknown(err.to_string()),
+            },
         }
     }
 }
 
 impl From<TransparencyLogError> for RegistryError {
     fn from(err: TransparencyLogError) -> RegistryError {
-        RegistryError {
-            code: RegistryErrorCode::Unknown(err.to_string()),
+        match err {
+            TransparencyLogError::NodeAlreadyExists { .. } => RegistryError {
+                code: RegistryErrorCode::BadRequest(err.to_string()),
+            },
+            _ => RegistryError {
+                code: RegistryErrorCode::Unknown(err.to_string()),
+            },
         }
     }
 }
@@ -142,6 +153,10 @@ pub async fn custom_recover(err: Rejection) -> Result<impl Reply, Infallible> {
             RegistryErrorCode::ManifestUnknown => {
                 status_code = StatusCode::NOT_FOUND;
                 error_message.code = RegistryErrorCode::ManifestUnknown;
+            }
+            RegistryErrorCode::BadRequest(m) => {
+                status_code = StatusCode::BAD_REQUEST;
+                error_message.code = RegistryErrorCode::BadRequest(m.clone());
             }
             RegistryErrorCode::Unknown(m) => {
                 error_message.message = m.clone();
@@ -223,11 +238,11 @@ mod tests {
 
     #[test]
     fn from_transparency_log_error() {
-        let transparency_log_error_1 = TransparencyLogError::NotFound {
+        let transparency_log_error_1 = TransparencyLogError::ArtifactNotFound {
             package_type: PackageType::Docker,
             package_specific_artifact_id: "package_specific_artifact_id".to_owned(),
         };
-        let transparency_log_error_2 = TransparencyLogError::NotFound {
+        let transparency_log_error_2 = TransparencyLogError::ArtifactNotFound {
             package_type: PackageType::Docker,
             package_specific_artifact_id: "package_specific_artifact_id".to_owned(),
         };
