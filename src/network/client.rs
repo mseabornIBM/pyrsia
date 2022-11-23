@@ -312,6 +312,8 @@ impl Client {
             metric
         );
 
+        thread::sleep(time::Duration::from_secs(5));
+        
         self.sender
             .send(Command::RespondIdleMetric { metric, channel })
             .await?;
