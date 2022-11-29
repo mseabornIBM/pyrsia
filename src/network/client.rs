@@ -38,6 +38,9 @@ struct IdleMetric {
     pub peer: PeerId,
     pub metric: f64,
 }
+
+const MAX_PEER_COUNT: i32 = 20;
+const PEER_TIMEOUT: u64 = 1;
 /* peer metric support */
 
 /// A utility struct for easily defining a hash from different
@@ -260,17 +263,22 @@ impl Client {
             providers.len()
         );
         let mut idle_metrics: Vec<IdleMetric> = Vec::new();
+        let mut count: i32 = 1;
         for peer in providers.iter() {
-            let (sender, receiver) = oneshot::channel();
+            let (sender, mut receiver) = oneshot::channel();
             self.sender
                 .send(Command::RequestIdleMetric {
                     peer: *peer,
                     sender,
                 })
                 .await?;
-
-            let dur = Duration::from_millis(500);
-            match timeout(dur, receiver)
+            if count > MAX_PEER_COUNT {
+                break;
+            }
+            let mut timed_out: bool = false;
+            let dur = Duration::from_millis(PEER_TIMEOUT);
+            
+            match timeout(dur, &mut receiver)
                 .await
                 .expect("Sender not to be dropped.")
             {
@@ -299,8 +307,17 @@ impl Client {
                             "p2p::Client::get_idle_peer() Unable to get peer metric for peer {} error {}",
                             peer, e
                         );
+                        debug!(
+                            "p2p::Client::get_idle_peer() Canceling request from timed out peer {} error {}",
+                            peer, e
+                        );
+                        timed_out = true;
                 }
             };
+            if timed_out == true {
+                receiver.close();
+            }
+            count = count + 1;
         }
 
         //sort the peers in ascending order according to their idle metric and return top of list
