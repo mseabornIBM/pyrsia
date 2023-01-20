@@ -1,20 +1,19 @@
 [package]
 name = "pyrsia_cli"
-version = "0.2.0"
+version = "0.2.4"
 build = "build.rs"
 description = "Decentralized Package Network"
 edition = "2021"
 
 [dependencies]
 pyrsia = {path=".."}
-anyhow = "1.0.66"
-clap = { version = "3.2.22", features= ["cargo"] }
-confy = "0.5.0"
+anyhow = "1.0.68"
+clap = { version = "4.0.32", features = [ "cargo" ] }
+confy = "0.5.1"
 const_format = "0.2.26"
 futures = { version = "0.3.*"}
 lazy_static = "1.4.0"
-regex = "1.6.0"
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.11.14", features = ["json", "rustls-tls"], default-features = false}
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = [ "full"] }
@@ -26,5 +25,5 @@ path = "src/main.rs"
 
 [build-dependencies]
 anyhow = "1.0"
-vergen = "7.4.0"
+vergen = "7.5.0"
 

@@ -113,7 +113,7 @@ distribution to other nodes.
 
 ## Inspect the Pyrsia transparency log
 
-Now, let's take a look at the transparency logs.
+Now, let's take a look at the transparency logs. Transperency logs are a record of all publically trusted digital certificates.
 
 If you ran through all the steps of the [installation tutorial](/docs/tutorials/quick-installation.mdx), the Pyrsia CLI tool will be available.
 
@@ -124,18 +124,17 @@ If you have started your Pyrsia node with default settings, you can skip this st
 Otherwise configure the CLI tool with your required settings:
 
 ```sh
- pyrsia config --edit
+ pyrsia config -e
  ```
 
-And enter the correct values:
+And enter the correct values or accept the default:
 
 ```text
-Enter host:
-localhost
-Enter port:
-7888
-Enter disk space to be allocated to pyrsia(Please enter with units ex: 10 GB):
-10 GB
+Enter host: [localhost]
+
+Enter port: [7888]
+
+Enter disk space to be allocated to pyrsia(Please enter with units ex: 10 GB): [10 GB]
 
 Node configuration Saved !!
 ```
@@ -250,3 +249,27 @@ pyrsia build docker --image alpine:3.16.3
 This will send the build request to one of the authorized build nodes, which will
 start a build. When consensus about that build is reached, it will be available
 in the transparency logs and can be retrieved by all nodes in the network.
+
+## Use API
+
+Pyrsia supports a subset of the [Docker Registry API](https://docs.docker.com/registry/spec/api/). A more detailed API document specific to Pyrsia, will be coming soon.
+
+```shell
+$ curl -sS http://localhost:7888/v2/library/alpine/manifests/3.16.2
+{
+   "schemaVersion": 2,
+   "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+   "config": {
+      "mediaType": "application/vnd.docker.container.image.v1+json",
+      "size": 1470,
+      "digest": "sha256:9c6f0724472873bb50a2ae67a9e7adcb57673a183cea8b06eb778dca859181b5"
+   },
+   "layers": [
+      {
+         "mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip",
+         "size": 2806054,
+         "digest": "sha256:213ec9aee27d8be045c6a92b7eac22c9a64b44558193775a1a7f626352392b49"
+      }
+   ]
+}%
+```

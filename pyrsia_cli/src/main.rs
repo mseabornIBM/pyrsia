@@ -30,32 +30,44 @@ async fn main() {
 
     match matches.subcommand() {
         Some(("config", config_matches)) => {
-            match config_matches.subcommand() {
-                Some(("edit", edit_config_matches)) => {
-                    if vec!["host", "port", "diskspace"]
-                        .into_iter()
-                        .any(|opt_str| edit_config_matches.contains_id(opt_str))
-                    {
-                        let host_name = edit_config_matches.try_get_one::<String>("host").unwrap();
-                        let port = edit_config_matches.try_get_one::<String>("port").unwrap();
-                        let diskspace = edit_config_matches
-                            .try_get_one::<String>("diskspace")
-                            .unwrap();
-                        match config_edit(host_name.cloned(), port.cloned(), diskspace.cloned()) {
-                            Ok(_) => {
-                                println!("Node configuration Saved !!");
-                            }
-                            Err(error) => {
-                                eprintln!("ERROR: {}", error);
-                            }
+            if let Some(("edit", edit_config_matches)) = config_matches.subcommand() {
+                if vec!["host", "port", "diskspace"]
+                    .into_iter()
+                    .any(|opt_str| edit_config_matches.contains_id(opt_str))
+                {
+                    let host_name = edit_config_matches.get_one::<String>("host");
+                    let port = edit_config_matches.get_one::<String>("port");
+                    let diskspace = edit_config_matches.get_one::<String>("diskspace");
+                    match config_edit(host_name.cloned(), port.cloned(), diskspace.cloned()) {
+                        Ok(_) => {
+                            println!("Node configuration saved !!");
                         }
-                    } else {
-                        config_add();
+                        Err(error) => {
+                            eprintln!("Error saving node configuration: {}", error);
+                        }
+                    }
+                } else {
+                    match config_add() {
+                        Ok(_) => {
+                            println!("Node configuration saved !!");
+                        }
+                        Err(error) => {
+                            eprintln!("Error saving node configuration: {}", error);
+                        }
                     }
                 }
-                _ => {}
             }
-            if config_matches.is_present("show") {
+            if *config_matches.get_one::<bool>("remove").unwrap_or(&false) {
+                match config_remove() {
+                    Ok(_) => {
+                        println!("Node configuration removed !!");
+                    }
+                    Err(error) => {
+                        eprintln!("Error removing node configuration: {}", error);
+                    }
+                }
+            }
+            if *config_matches.get_one::<bool>("show").unwrap_or(&false) {
                 config_show();
             }
         }
@@ -68,6 +80,9 @@ async fn main() {
             }
             Some(("maven", maven_matches)) => {
                 request_maven_build(maven_matches.get_one::<String>("gav").unwrap()).await;
+            }
+            Some(("status", status_matches)) => {
+                request_build_status(status_matches.get_one::<String>("id").unwrap()).await;
             }
             _ => {}
         },

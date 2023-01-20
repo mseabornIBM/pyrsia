@@ -24,6 +24,8 @@ use crate::structures::header::Ordinal;
 pub enum BlockchainError {
     #[error("Anyhow Error")]
     AnyhowError(#[from] anyhow::Error),
+    #[error("Channel Closed")]
+    ChannelClosed(#[from] tokio::sync::oneshot::error::RecvError),
     #[error("Serialization Error")]
     SerializationError(#[from] bincode::Error),
     #[error("IO Error")]
@@ -46,4 +48,6 @@ pub enum BlockchainError {
     LaggingBlockchainData,
     #[error("Invalid storage path: {0}")]
     InvalidStoragePath(PathBuf),
+    #[error("Could not connect to blockchain topic")]
+    InvalidTopic,
 }

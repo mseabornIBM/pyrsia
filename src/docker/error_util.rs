@@ -37,7 +37,6 @@ pub struct ErrorMessages {
 #[derive(Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub enum RegistryErrorCode {
     BlobUnknown,
-    BlobDoesNotExist(String),
     ManifestUnknown,
     BadRequest(String),
     Unknown(String),
@@ -146,10 +145,6 @@ pub async fn custom_recover(err: Rejection) -> Result<impl Reply, Infallible> {
                 status_code = StatusCode::NOT_FOUND;
                 error_message.code = RegistryErrorCode::BlobUnknown;
             }
-            RegistryErrorCode::BlobDoesNotExist(hash) => {
-                status_code = StatusCode::NOT_FOUND;
-                error_message.code = RegistryErrorCode::BlobDoesNotExist(hash.to_string());
-            }
             RegistryErrorCode::ManifestUnknown => {
                 status_code = StatusCode::NOT_FOUND;
                 error_message.code = RegistryErrorCode::ManifestUnknown;
@@ -157,6 +152,7 @@ pub async fn custom_recover(err: Rejection) -> Result<impl Reply, Infallible> {
             RegistryErrorCode::BadRequest(m) => {
                 status_code = StatusCode::BAD_REQUEST;
                 error_message.code = RegistryErrorCode::BadRequest(m.clone());
+                error_message.message = m.clone();
             }
             RegistryErrorCode::Unknown(m) => {
                 error_message.message = m.clone();
@@ -277,28 +273,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn custom_recover_from_registry_error_for_blob_does_not_exist() {
-        let registry_error = RegistryError {
-            code: RegistryErrorCode::BlobDoesNotExist(String::from("non_existing_blob_hash")),
-        };
-
-        let expected_body = serde_json::to_string(&ErrorMessages {
-            errors: vec![ErrorMessage {
-                code: RegistryErrorCode::BlobDoesNotExist(String::from("non_existing_blob_hash")),
-                message: "".to_string(),
-            }],
-        })
-        .expect("Generating JSON body should not fail.");
-
-        let response = custom_recover(registry_error.into())
-            .await
-            .expect("Reply should be created.")
-            .into_response();
-
-        verify_recover_response(response, expected_body, StatusCode::NOT_FOUND).await;
-    }
-
-    #[tokio::test]
     async fn custom_recover_from_registry_error_for_manifest_unknown() {
         let registry_error = RegistryError {
             code: RegistryErrorCode::ManifestUnknown,
@@ -318,6 +292,28 @@ mod tests {
             .into_response();
 
         verify_recover_response(response, expected_body, StatusCode::NOT_FOUND).await;
+    }
+
+    #[tokio::test]
+    async fn custom_recover_from_registry_error_bad_request() {
+        let registry_error = RegistryError {
+            code: RegistryErrorCode::BadRequest(String::from("bad_request")),
+        };
+
+        let expected_body = serde_json::to_string(&ErrorMessages {
+            errors: vec![ErrorMessage {
+                code: RegistryErrorCode::BadRequest("bad_request".to_string()),
+                message: String::from("bad_request"),
+            }],
+        })
+        .expect("Generating JSON body should not fail.");
+
+        let response = custom_recover(registry_error.into())
+            .await
+            .expect("Reply should be created.")
+            .into_response();
+
+        verify_recover_response(response, expected_body, StatusCode::BAD_REQUEST).await;
     }
 
     #[tokio::test]

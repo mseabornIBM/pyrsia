@@ -31,11 +31,11 @@ to be run manually. Also the installer is not yet signed, so you need to ignore 
 
 - Run the installer
     - Either simply double-click or use the `msiexec` command described below
-    - You need to ignore a warning because we didn't sign our installer yet
+    - If you get a "Windows protected your PC" warning, click more info, and click run anyway because we haven't signed our installer yet.
 
 Instead of double-clicking the installer, you can also run it like this, open a command prompt (type: Win+R + cmd):
 ```shell
-msiexec /i Downloads/pyrsia-installer-0.2.0.msi ROOTDRIVE="C:"
+msiexec /i Downloads/pyrsia-installer-0.2.2.msi ROOTDRIVE="C:"
 ```
 
 - The installer will now install Pyrsia (pyrsia_node.exe and pyrsia.exe) in `C:\Pyrsia` unless you specified a different
@@ -46,7 +46,7 @@ msiexec /i Downloads/pyrsia-installer-0.2.0.msi ROOTDRIVE="C:"
 ```shell
 SET RUST_LOG=info
 cd c:\Pyrsia\Pyrsia\service
-pyrsia_node.exe
+.\pyrsia_node.exe
 ```
 
 This will start your local Pyrsia node with `info` logs. (you can also skip `SET RUST_LOG=info` if you don't want logs,
@@ -62,7 +62,7 @@ pyrsia --version
 ```
 
 ```text
-pyrsia_cli 0.2.0
+pyrsia_cli 0.2.2
 ```
 
 ```shell
@@ -131,20 +131,17 @@ brew tap pyrsia/pyrsia
 ```shell
 brew install pyrsia
 ```
-- Open a terminal and start Pyrsia Node using the following
+- Open a terminal and start Pyrsia Node as background service using the following
 ```shell
-export RUST_LOG=info
-cd ~
-pyrsia_node
+brew services start pyrsia
 ```
-This will start Pyrsia node in you local machine with logging level set to `info`. (For additional level of logging, you can also set this to `export RUST_LOG=debug`.)
+As per service configuration, Pyrsia Node service logging level set to `info` except module pyrsia set to `debug`.
 
-When you start the Pyrsia node for first time, a directory named pyrsia is created in the current directory. Also macOS might ask for network connection permission. So make sure to
-allow this.
+When you start the Pyrsia node for the first time, a directory is created in `$(brew --prefix)/var/pyrsia/` where all logs and blockchain data are saved. Also macOS might ask for network connection permission. So make sure to allow this.
 
-- Once Pyrsia node is running state, the log will display similar kind of logs in the terminal
+- Once Pyrsia node is running state, similar kind of logs can be found in the Homebrew log file.
 ```
- $ pyrsia_node -H 0.0.0.0
+ $ tail -f $(brew --prefix)/var/pyrsia/logs/stdout/pyrsia_node.log
  2022-10-20T07:45:57.707Z INFO  pyrsia_node > Pyrsia Node will start running on 0.0.0.0:7888
  2022-10-20T07:45:57.708Z INFO  pyrsia_node > Looking up bootstrap node
  2022-10-20T07:45:57.709Z INFO  pyrsia::network::event_loop > Local node is listening on "/ip4/192.168.86.171/tcp/54690/p2p/12D3KooWL8xbhUABLVUAmpcVoCZSghRX1XZZmoyMPo4VC28CEx6P"
@@ -159,7 +156,7 @@ allow this.
 ```shell
 pyrsia --version
 ```
-Display the version `pyrsia_cli 0.2.0`
+Display the version `pyrsia_cli 0.2.2`
     - To verify your local Pyrsia node connected to Pyrsia network
 ```shell
 pyrsia ping
@@ -204,11 +201,25 @@ sudo apt-get update
 sudo apt-get install -y pyrsia
 ```
 
+### Installer Bootstrapping other than default cluster
+
+To connect Pyrsia peer-node authorized boot-node other than default authorize boot node, here is the hack. You have to
+make some edits to `pyrsia.service` file.
+
+```shell
+# E.G. bootstrapping to nightly-cluster.
+sudo sed -i '/ExecStart=/ s/$/ --bootstrap-url http:\/\/boot.nightly.pyrsia.link\/status/' $(sudo find /etc -name pyrsia.service)
+
+# reload daemon & restart service
+systemctl daemon-reload
+service pyrsia restart
+```
+
 ### Verify everything is running smoothly
 
 ```sh
 $ pyrsia --version
-pyrsia 0.2.0
+pyrsia 0.2.2
 $ pyrsia ping
 Connection Successful !!
 ```
@@ -264,7 +275,7 @@ Make sure you have Docker installed on your system and run in the background:
 (Add an option `-e RUST_LOG=debug` to change the log level from the default value, `info`.)
 
 ```sh
-docker run -d -p 7888:7888 --name pyrsia_node pyrsiaoss/pyrsia-node:0.2.0-2342
+docker run -d -p 7888:7888 --name pyrsia_node pyrsiaoss/pyrsia-node:0.2.2-2699
 ```
 
 Tail the logs to check if Pyrsia started correctly:
@@ -287,7 +298,7 @@ Use this `docker-compose.yml` file:
 ```yaml
 services:
   pyrsia:
-    image: pyrsiaoss/pyrsia-node:0.2.0-2342
+    image: pyrsiaoss/pyrsia-node:0.2.2-2699
     ports:
       - "7888:7888"
     volumes:

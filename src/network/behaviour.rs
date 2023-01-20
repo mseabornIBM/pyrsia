@@ -23,12 +23,16 @@ use crate::network::idle_metric_protocol::{
 };
 
 use crate::network::build_protocol::{BuildExchangeCodec, BuildRequest, BuildResponse};
+use crate::network::build_status_protocol::{
+    BuildStatusExchangeCodec, BuildStatusRequest, BuildStatusResponse,
+};
 use libp2p::autonat;
-use libp2p::identify::{Identify, IdentifyEvent};
+use libp2p::gossipsub;
+use libp2p::identify;
 use libp2p::kad::record::store::MemoryStore;
 use libp2p::kad::{Kademlia, KademliaEvent};
 use libp2p::request_response::{RequestResponse, RequestResponseEvent};
-use libp2p::NetworkBehaviour;
+use libp2p::swarm::NetworkBehaviour;
 
 /// Defines the [`NetworkBehaviour`] to be used in the libp2p
 /// Swarm. The PyrsiaNetworkBehaviour consists of the following
@@ -42,12 +46,14 @@ use libp2p::NetworkBehaviour;
 #[behaviour(out_event = "PyrsiaNetworkEvent")]
 pub struct PyrsiaNetworkBehaviour {
     pub auto_nat: autonat::Behaviour,
-    pub identify: Identify,
+    pub gossipsub: gossipsub::Gossipsub,
+    pub identify: identify::Behaviour,
     pub kademlia: Kademlia<MemoryStore>,
     pub request_response: RequestResponse<ArtifactExchangeCodec>,
     pub build_request_response: RequestResponse<BuildExchangeCodec>,
     pub idle_metric_request_response: RequestResponse<IdleMetricExchangeCodec>,
     pub blockchain_request_response: RequestResponse<BlockchainExchangeCodec>,
+    pub build_status_request_response: RequestResponse<BuildStatusExchangeCodec>,
 }
 
 /// Each event in the `PyrsiaNetworkBehaviour` is wrapped in a
@@ -55,29 +61,37 @@ pub struct PyrsiaNetworkBehaviour {
 #[derive(Debug)]
 pub enum PyrsiaNetworkEvent {
     AutoNat(autonat::Event),
-    Identify(IdentifyEvent),
-    Kademlia(KademliaEvent),
+    Gossipsub(gossipsub::GossipsubEvent),
+    Identify(Box<identify::Event>),
+    Kademlia(Box<KademliaEvent>),
     RequestResponse(RequestResponseEvent<ArtifactRequest, ArtifactResponse>),
     BuildRequestResponse(RequestResponseEvent<BuildRequest, BuildResponse>),
     IdleMetricRequestResponse(RequestResponseEvent<IdleMetricRequest, IdleMetricResponse>),
     BlockchainRequestResponse(RequestResponseEvent<BlockchainRequest, BlockchainResponse>),
+    BuildStatusRequestResponse(RequestResponseEvent<BuildStatusRequest, BuildStatusResponse>),
 }
 
 impl From<autonat::Event> for PyrsiaNetworkEvent {
-    fn from(v: autonat::Event) -> Self {
-        PyrsiaNetworkEvent::AutoNat(v)
+    fn from(event: autonat::Event) -> Self {
+        PyrsiaNetworkEvent::AutoNat(event)
     }
 }
 
-impl From<IdentifyEvent> for PyrsiaNetworkEvent {
-    fn from(event: IdentifyEvent) -> Self {
-        PyrsiaNetworkEvent::Identify(event)
+impl From<gossipsub::GossipsubEvent> for PyrsiaNetworkEvent {
+    fn from(event: gossipsub::GossipsubEvent) -> Self {
+        PyrsiaNetworkEvent::Gossipsub(event)
+    }
+}
+
+impl From<identify::Event> for PyrsiaNetworkEvent {
+    fn from(event: identify::Event) -> Self {
+        PyrsiaNetworkEvent::Identify(Box::new(event))
     }
 }
 
 impl From<KademliaEvent> for PyrsiaNetworkEvent {
     fn from(event: KademliaEvent) -> Self {
-        PyrsiaNetworkEvent::Kademlia(event)
+        PyrsiaNetworkEvent::Kademlia(Box::new(event))
     }
 }
 
@@ -102,5 +116,11 @@ impl From<RequestResponseEvent<IdleMetricRequest, IdleMetricResponse>> for Pyrsi
 impl From<RequestResponseEvent<BlockchainRequest, BlockchainResponse>> for PyrsiaNetworkEvent {
     fn from(event: RequestResponseEvent<BlockchainRequest, BlockchainResponse>) -> Self {
         PyrsiaNetworkEvent::BlockchainRequestResponse(event)
+    }
+}
+
+impl From<RequestResponseEvent<BuildStatusRequest, BuildStatusResponse>> for PyrsiaNetworkEvent {
+    fn from(event: RequestResponseEvent<BuildStatusRequest, BuildStatusResponse>) -> Self {
+        PyrsiaNetworkEvent::BuildStatusRequestResponse(event)
     }
 }

@@ -16,6 +16,7 @@
 
 use super::model::PackageType;
 use super::storage::ArtifactStorage;
+use crate::blockchain_service::event::BlockchainEventClient;
 use crate::build_service::error::BuildError;
 use crate::build_service::event::BuildEventClient;
 use crate::build_service::model::BuildResult;
@@ -48,7 +49,7 @@ pub struct ArtifactService {
 impl ArtifactService {
     pub fn new<P: AsRef<Path>>(
         artifact_path: P,
-        transparency_log_service: TransparencyLogService,
+        blockchain_event_client: BlockchainEventClient,
         build_event_client: BuildEventClient,
         p2p_client: Client,
     ) -> anyhow::Result<Self> {
@@ -56,7 +57,10 @@ impl ArtifactService {
         Ok(ArtifactService {
             artifact_storage,
             build_event_client,
-            transparency_log_service,
+            transparency_log_service: TransparencyLogService::new(
+                artifact_path,
+                blockchain_event_client,
+            )?,
             p2p_client,
         })
     }
@@ -104,7 +108,7 @@ impl ArtifactService {
         // prevent duplicated builds
         self.transparency_log_service
             .verify_package_can_be_added_to_transparency_logs(&package_type, &package_specific_id)
-            .map_err(|t| BuildError::ArtifactAlreadyExists(format!("{:?}", t)))?;
+            .map_err(|t| BuildError::ArtifactAlreadyExists(t.to_string()))?;
 
         if local_peer_id.eq(&peer_id) {
             debug!("Start local build in authorized node");
@@ -171,6 +175,43 @@ impl ArtifactService {
         }
 
         Ok(())
+    }
+
+    pub async fn get_build_status(&mut self, build_id: &str) -> Result<String, BuildError> {
+        let local_peer_id = self.p2p_client.local_peer_id;
+        debug!("Got local node with peer_id: {:?}", local_peer_id.clone());
+
+        let nodes = self
+            .transparency_log_service
+            .get_authorized_nodes()
+            .map_err(|e| BuildError::BuildStatusFailed(e.to_string()))?;
+
+        let peer_id = match nodes
+            .iter()
+            .map(|node| PeerId::from_str(&node.node_id).unwrap())
+            .find_or_last(|&auth_peer_id| local_peer_id.eq(&auth_peer_id))
+        {
+            Some(auth_peer_id) => {
+                debug!(
+                    "Got authorized node with peer_id: {:?}",
+                    auth_peer_id.clone()
+                );
+                auth_peer_id
+            }
+            None => panic!("Error while looking for authorized nodes (build status)"),
+        };
+
+        if local_peer_id.eq(&peer_id) {
+            debug!("Get build status (authorized node)");
+            self.build_event_client.get_build_status(build_id).await
+        } else {
+            debug!("Request build status in authorized node from p2p network");
+            self.p2p_client
+                .clone()
+                .request_build_status(&peer_id, String::from(build_id))
+                .await
+                .map_err(|e| BuildError::BuildStatusFailed(e.to_string()))
+        }
     }
 
     pub async fn handle_block_added(
@@ -356,7 +397,7 @@ impl ArtifactService {
 #[cfg(not(tarpaulin_include))]
 mod tests {
     use super::*;
-    use crate::blockchain_service::service::BlockchainService;
+    use crate::blockchain_service::event::BlockchainEvent;
     use crate::build_service::event::BuildEvent;
     use crate::network::client::command::Command;
     use crate::network::idle_metric_protocol::PeerMetrics;
@@ -367,8 +408,6 @@ mod tests {
     use std::collections::HashSet;
     use std::env;
     use std::path::PathBuf;
-    use std::sync::Arc;
-    use tokio::sync::{mpsc, Mutex};
     use tokio::task;
 
     const VALID_ARTIFACT_HASH: [u8; 32] = [
@@ -377,65 +416,31 @@ mod tests {
         0x4f,
     ];
 
-    fn create_p2p_client(keypair: &Keypair) -> (mpsc::Receiver<Command>, Client) {
-        let (command_sender, command_receiver) = mpsc::channel(1);
-        let p2p_client = Client {
-            sender: command_sender,
-            local_peer_id: PublicKey::Ed25519(keypair.public()).to_peer_id(),
-        };
-
-        (command_receiver, p2p_client)
-    }
-
-    async fn create_artifact_service(
-        artifact_path: impl AsRef<Path>,
-        keypair: &Keypair,
-        p2p_client: Client,
-    ) -> (mpsc::Receiver<BuildEvent>, ArtifactService) {
-        let blockchain_service = BlockchainService::init_first_blockchain_node(
-            keypair,
-            keypair,
-            p2p_client.clone(),
-            &artifact_path,
-        )
-        .await
-        .expect("Creating BlockchainService failed");
-
-        let transparency_log_service =
-            TransparencyLogService::new(&artifact_path, Arc::new(Mutex::new(blockchain_service)))
-                .expect("Creating TransparencyLogService failed");
-
-        let (build_event_sender, build_event_receiver) = mpsc::channel(1);
-        let build_event_client = BuildEventClient::new(build_event_sender);
-
-        let artifact_service = ArtifactService::new(
-            &artifact_path,
-            transparency_log_service,
-            build_event_client,
-            p2p_client,
-        )
-        .expect("Creating ArtifactService failed");
-
-        (build_event_receiver, artifact_service)
-    }
-
     #[tokio::test]
     async fn test_put_and_get_artifact() {
         let tmp_dir = test_util::tests::setup();
 
-        let keypair = Keypair::generate();
-
-        let (mut command_receiver, p2p_client) = create_p2p_client(&keypair);
-        let (_build_event_receiver, mut artifact_service) =
-            create_artifact_service(&tmp_dir, &keypair, p2p_client.clone()).await;
+        let (mut artifact_service, mut blockchain_event_receiver, _, mut p2p_command_receiver) =
+            test_util::tests::create_artifact_service(&tmp_dir);
 
         tokio::spawn(async move {
             loop {
-                match command_receiver.recv().await {
+                match p2p_command_receiver.recv().await {
                     Some(Command::ListPeers { sender, .. }) => {
                         let _ = sender.send(HashSet::new());
                     }
                     _ => panic!("Command must match Command::ListPeers"),
+                }
+            }
+        });
+
+        tokio::spawn(async move {
+            loop {
+                match blockchain_event_receiver.recv().await {
+                    Some(BlockchainEvent::AddBlock { sender, .. }) => {
+                        let _ = sender.send(Ok(()));
+                    }
+                    _ => panic!("BlockchainEvent must match BlockchainEvent::AddBlock"),
                 }
             }
         });
@@ -494,22 +499,30 @@ mod tests {
     async fn test_put_and_list_artifact() {
         let tmp_dir = test_util::tests::setup();
 
-        let keypair = Keypair::generate();
-
-        let (mut command_receiver, p2p_client) = create_p2p_client(&keypair);
-        let (_build_event_receiver, mut artifact_service) =
-            create_artifact_service(&tmp_dir, &keypair, p2p_client.clone()).await;
+        let (mut artifact_service, mut blockchain_event_receiver, _, mut p2p_command_receiver) =
+            test_util::tests::create_artifact_service(&tmp_dir);
 
         tokio::spawn(async move {
             loop {
-                match command_receiver.recv().await {
+                match p2p_command_receiver.recv().await {
                     Some(Command::ListPeers { sender, .. }) => {
                         let _ = sender.send(HashSet::new());
                     }
                     Some(Command::Provide { sender, .. }) => {
                         let _ = sender.send(());
                     }
-                    _ => panic!("Command must match Command::ListPeers"),
+                    _ => panic!("Command must match Command::ListPeers or Command::Provide"),
+                }
+            }
+        });
+
+        tokio::spawn(async move {
+            loop {
+                match blockchain_event_receiver.recv().await {
+                    Some(BlockchainEvent::AddBlock { sender, .. }) => {
+                        let _ = sender.send(Ok(()));
+                    }
+                    _ => panic!("BlockchainEvent must match BlockchainEvent::AddBlock"),
                 }
             }
         });
@@ -559,15 +572,13 @@ mod tests {
     async fn test_get_from_peers() {
         let tmp_dir = test_util::tests::setup();
 
-        let keypair = Keypair::generate();
-
-        let (mut command_receiver, p2p_client) = create_p2p_client(&keypair);
-        let (_build_event_receiver, mut artifact_service) =
-            create_artifact_service(&tmp_dir, &keypair, p2p_client.clone()).await;
+        let (p2p_client, mut p2p_command_receiver) = test_util::tests::create_p2p_client();
+        let (mut artifact_service, mut blockchain_event_receiver, _) =
+            test_util::tests::create_artifact_service_with_p2p_client(&tmp_dir, p2p_client.clone());
 
         tokio::spawn(async move {
             loop {
-                match command_receiver.recv().await {
+                match p2p_command_receiver.recv().await {
                     Some(Command::ListPeers { sender, .. }) => {
                         let _ = sender.send(HashSet::new());
                     },
@@ -585,6 +596,17 @@ mod tests {
                         let _ = sender.send(Ok(b"SAMPLE_DATA".to_vec()));
                     },
                     _ => panic!("Command must match Command::ListPeers, Command::ListProviders, Command::RequestIdleMetric, Command::RequestArtifact"),
+                }
+            }
+        });
+
+        tokio::spawn(async move {
+            loop {
+                match blockchain_event_receiver.recv().await {
+                    Some(BlockchainEvent::AddBlock { sender, .. }) => {
+                        let _ = sender.send(Ok(()));
+                    }
+                    _ => panic!("BlockchainEvent must match BlockchainEvent::AddBlock"),
                 }
             }
         });
@@ -627,15 +649,12 @@ mod tests {
     async fn test_get_from_peers_with_no_providers() {
         let tmp_dir = test_util::tests::setup();
 
-        let keypair = Keypair::generate();
-
-        let (mut command_receiver, p2p_client) = create_p2p_client(&keypair);
-        let (_build_event_receiver, mut artifact_service) =
-            create_artifact_service(&tmp_dir, &keypair, p2p_client.clone()).await;
+        let (mut artifact_service, _, _, mut p2p_command_receiver) =
+            test_util::tests::create_artifact_service(&tmp_dir);
 
         tokio::spawn(async move {
             tokio::select! {
-                command = command_receiver.recv() => {
+                command = p2p_command_receiver.recv() => {
                     match command {
                         Some(Command::ListProviders { sender, .. }) => {
                             let _ = sender.send(Default::default());
@@ -662,19 +681,27 @@ mod tests {
     async fn test_verify_artifact_succeeds_when_hashes_same() {
         let tmp_dir = test_util::tests::setup();
 
-        let keypair = Keypair::generate();
-
-        let (mut command_receiver, p2p_client) = create_p2p_client(&keypair);
-        let (_build_event_receiver, mut artifact_service) =
-            create_artifact_service(&tmp_dir, &keypair, p2p_client.clone()).await;
+        let (mut artifact_service, mut blockchain_event_receiver, _, mut p2p_command_receiver) =
+            test_util::tests::create_artifact_service(&tmp_dir);
 
         tokio::spawn(async move {
             loop {
-                match command_receiver.recv().await {
+                match p2p_command_receiver.recv().await {
                     Some(Command::ListPeers { sender, .. }) => {
                         let _ = sender.send(HashSet::new());
                     }
                     _ => panic!("Command must match Command::ListPeers"),
+                }
+            }
+        });
+
+        tokio::spawn(async move {
+            loop {
+                match blockchain_event_receiver.recv().await {
+                    Some(BlockchainEvent::AddBlock { sender, .. }) => {
+                        let _ = sender.send(Ok(()));
+                    }
+                    _ => panic!("BlockchainEvent must match BlockchainEvent::AddBlock"),
                 }
             }
         });
@@ -719,19 +746,27 @@ mod tests {
     async fn test_verify_artifact_fails_when_hashes_differ() {
         let tmp_dir = test_util::tests::setup();
 
-        let keypair = Keypair::generate();
-
-        let (mut command_receiver, p2p_client) = create_p2p_client(&keypair);
-        let (_build_event_receiver, mut artifact_service) =
-            create_artifact_service(&tmp_dir, &keypair, p2p_client.clone()).await;
+        let (mut artifact_service, mut blockchain_event_receiver, _, mut p2p_command_receiver) =
+            test_util::tests::create_artifact_service(&tmp_dir);
 
         tokio::spawn(async move {
             loop {
-                match command_receiver.recv().await {
+                match p2p_command_receiver.recv().await {
                     Some(Command::ListPeers { sender, .. }) => {
                         let _ = sender.send(HashSet::new());
                     }
                     _ => panic!("Command must match Command::ListPeers"),
+                }
+            }
+        });
+
+        tokio::spawn(async move {
+            loop {
+                match blockchain_event_receiver.recv().await {
+                    Some(BlockchainEvent::AddBlock { sender, .. }) => {
+                        let _ = sender.send(Ok(()));
+                    }
+                    _ => panic!("BlockchainEvent must match BlockchainEvent::AddBlock"),
                 }
             }
         });
@@ -794,19 +829,27 @@ mod tests {
     async fn test_get_artifact_logs() {
         let tmp_dir = test_util::tests::setup();
 
-        let keypair = Keypair::generate();
-
-        let (mut command_receiver, p2p_client) = create_p2p_client(&keypair);
-        let (_build_event_receiver, mut artifact_service) =
-            create_artifact_service(&tmp_dir, &keypair, p2p_client.clone()).await;
+        let (mut artifact_service, mut blockchain_event_receiver, _, mut p2p_command_receiver) =
+            test_util::tests::create_artifact_service(&tmp_dir);
 
         tokio::spawn(async move {
             loop {
-                match command_receiver.recv().await {
+                match p2p_command_receiver.recv().await {
                     Some(Command::ListPeers { sender, .. }) => {
                         let _ = sender.send(HashSet::new());
                     }
                     _ => panic!("Command must match Command::ListPeers"),
+                }
+            }
+        });
+
+        tokio::spawn(async move {
+            loop {
+                match blockchain_event_receiver.recv().await {
+                    Some(BlockchainEvent::AddBlock { sender, .. }) => {
+                        let _ = sender.send(Ok(()));
+                    }
+                    _ => panic!("BlockchainEvent must match BlockchainEvent::AddBlock"),
                 }
             }
         });
@@ -847,11 +890,7 @@ mod tests {
     async fn test_request_build_without_authorized_nodes() {
         let tmp_dir = test_util::tests::setup();
 
-        let keypair = Keypair::generate();
-
-        let (_command_receiver, p2p_client) = create_p2p_client(&keypair);
-        let (_build_event_receiver, artifact_service) =
-            create_artifact_service(&tmp_dir, &keypair, p2p_client.clone()).await;
+        let (artifact_service, ..) = test_util::tests::create_artifact_service(&tmp_dir);
 
         let package_type = PackageType::Docker;
         let package_specific_id = "package_specific_id";
@@ -874,15 +913,13 @@ mod tests {
     async fn test_request_build_starts_on_local_authorized_node() {
         let tmp_dir = test_util::tests::setup();
 
-        let keypair = Keypair::generate();
-
-        let (mut command_receiver, p2p_client) = create_p2p_client(&keypair);
-        let (mut build_event_receiver, artifact_service) =
-            create_artifact_service(&tmp_dir, &keypair, p2p_client.clone()).await;
+        let (p2p_client, mut p2p_command_receiver) = test_util::tests::create_p2p_client();
+        let (artifact_service, mut blockchain_event_receiver, mut build_event_receiver) =
+            test_util::tests::create_artifact_service_with_p2p_client(&tmp_dir, p2p_client.clone());
 
         tokio::spawn(async move {
             loop {
-                match command_receiver.recv().await {
+                match p2p_command_receiver.recv().await {
                     Some(Command::ListPeers { sender, .. }) => {
                         let _ = sender.send(HashSet::new());
                     }
@@ -893,11 +930,23 @@ mod tests {
 
         tokio::spawn(async move {
             loop {
+                match blockchain_event_receiver.recv().await {
+                    Some(BlockchainEvent::AddBlock { sender, .. }) => {
+                        let _ = sender.send(Ok(()));
+                    }
+                    _ => panic!("BlockchainEvent must match BlockchainEvent::AddBlock"),
+                }
+            }
+        });
+        tokio::spawn(async move {
+            loop {
                 match build_event_receiver.recv().await {
                     Some(BuildEvent::Start { sender, .. }) => {
                         let _ = sender.send(Ok(String::from("build_start_ok")));
                     }
-                    _ => panic!("BuildEvent must match BuildEvent::Start"),
+                    _ => {
+                        panic!("BuildEvent must match BuildEvent::AddBlock or BuildEvent::Start")
+                    }
                 }
             }
         });
@@ -926,15 +975,12 @@ mod tests {
     async fn test_request_build_starts_on_other_authorized_node() {
         let tmp_dir = test_util::tests::setup();
 
-        let keypair = Keypair::generate();
-
-        let (mut command_receiver, p2p_client) = create_p2p_client(&keypair);
-        let (_build_event_receiver, artifact_service) =
-            create_artifact_service(&tmp_dir, &keypair, p2p_client.clone()).await;
+        let (artifact_service, mut blockchain_event_receiver, _, mut p2p_command_receiver) =
+            test_util::tests::create_artifact_service(&tmp_dir);
 
         tokio::spawn(async move {
             loop {
-                match command_receiver.recv().await {
+                match p2p_command_receiver.recv().await {
                     Some(Command::ListPeers { sender, .. }) => {
                         let _ = sender.send(HashSet::new());
                     }
@@ -945,6 +991,17 @@ mod tests {
                         "Command must match Command::ListPeers or Command::RequestBuild, was: {:?}",
                         other
                     ),
+                }
+            }
+        });
+
+        tokio::spawn(async move {
+            loop {
+                match blockchain_event_receiver.recv().await {
+                    Some(BlockchainEvent::AddBlock { sender, .. }) => {
+                        let _ = sender.send(Ok(()));
+                    }
+                    _ => panic!("BlockchainEvent must match BlockchainEvent::AddBlock"),
                 }
             }
         });
@@ -979,5 +1036,117 @@ mod tests {
         let path = String::from(curr_dir.to_string_lossy());
         let reader = File::open(path.as_str()).unwrap();
         Ok(reader)
+    }
+
+    #[tokio::test]
+    async fn test_get_build_status_on_authorized_node() {
+        let tmp_dir = test_util::tests::setup();
+
+        let (p2p_client, mut p2p_command_receiver) = test_util::tests::create_p2p_client();
+        let (mut artifact_service, mut blockchain_event_receiver, mut build_event_receiver) =
+            test_util::tests::create_artifact_service_with_p2p_client(&tmp_dir, p2p_client.clone());
+
+        let build_status: &str = "RUNNING";
+        tokio::spawn(async move {
+            loop {
+                match build_event_receiver.recv().await {
+                    Some(BuildEvent::Status { sender, .. }) => {
+                        let _ = sender.send(Ok(build_status.to_owned()));
+                    }
+                    other => panic!("BuildEvent must match BuildEvent::Status, was: {:?}", other),
+                }
+            }
+        });
+
+        tokio::spawn(async move {
+            loop {
+                match p2p_command_receiver.recv().await {
+                    Some(Command::ListPeers { sender, .. }) => {
+                        let _ = sender.send(HashSet::new());
+                    }
+                    other => panic!("Command must match Command::ListPeers, was: {:?}", other),
+                }
+            }
+        });
+
+        tokio::spawn(async move {
+            loop {
+                match blockchain_event_receiver.recv().await {
+                    Some(BlockchainEvent::AddBlock { sender, .. }) => {
+                        let _ = sender.send(Ok(()));
+                    }
+                    other => panic!(
+                        "BlockchainEvent must match BlockchainEvent::AddBlock, was: {:?}",
+                        other
+                    ),
+                }
+            }
+        });
+
+        artifact_service
+            .transparency_log_service
+            .add_authorized_node(p2p_client.local_peer_id)
+            .await
+            .unwrap();
+
+        let build_id = uuid::Uuid::new_v4().to_string();
+        let result = artifact_service.get_build_status(&build_id).await.unwrap();
+
+        assert_eq!(result, build_status);
+        test_util::tests::teardown(tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_get_build_status_on_other_authorized_node() {
+        let tmp_dir = test_util::tests::setup();
+
+        let (mut artifact_service, mut blockchain_event_receiver, _, mut p2p_command_receiver) =
+            test_util::tests::create_artifact_service(&tmp_dir);
+
+        let build_status: &str = "RUNNING";
+        tokio::spawn(async move {
+            loop {
+                match p2p_command_receiver.recv().await {
+                    Some(Command::ListPeers { sender, .. }) => {
+                        let _ = sender.send(HashSet::new());
+                    }
+                    Some(Command::RequestBuildStatus { sender, .. }) => {
+                        let _ = sender.send(Ok(build_status.to_owned()));
+                    }
+                    other => panic!(
+                        "Command must match Command::ListPeers or Command::RequestBuildStatus, was: {:?}",
+                        other
+                    ),
+                }
+            }
+        });
+
+        tokio::spawn(async move {
+            loop {
+                match blockchain_event_receiver.recv().await {
+                    Some(BlockchainEvent::AddBlock { sender, .. }) => {
+                        let _ = sender.send(Ok(()));
+                    }
+                    other => panic!(
+                        "BlockchainEvent must match BlockchainEvent::AddBlock, was: {:?}",
+                        other
+                    ),
+                }
+            }
+        });
+
+        let other_peer_id = PublicKey::Ed25519(Keypair::generate().public()).to_peer_id();
+        artifact_service
+            .transparency_log_service
+            .add_authorized_node(other_peer_id)
+            .await
+            .unwrap();
+
+        // request build status
+        let build_id = uuid::Uuid::new_v4().to_string();
+        let result = artifact_service.get_build_status(&build_id).await.unwrap();
+
+        assert_eq!(result, build_status);
+        test_util::tests::teardown(tmp_dir);
     }
 }

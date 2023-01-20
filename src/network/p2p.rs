@@ -24,13 +24,19 @@ use crate::util::keypair_util;
 use crate::util::keypair_util::KEYPAIR_FILENAME;
 
 use crate::network::build_protocol::{BuildExchangeCodec, BuildExchangeProtocol};
+use crate::network::build_status_protocol::{
+    BuildStatusExchangeCodec, BuildStatusExchangeProtocol,
+};
 use libp2p::identity::Keypair;
 use libp2p::kad::record::store::{MemoryStore, MemoryStoreConfig};
 use libp2p::request_response::{ProtocolSupport, RequestResponse};
 use libp2p::swarm::{Swarm, SwarmBuilder};
-use libp2p::tcp::{self, GenTcpConfig};
-use libp2p::{autonat, core, dns, identify, identity, kad, mplex, noise, yamux, Transport};
+use libp2p::{
+    autonat, core, dns, gossipsub, identify, identity, kad, mplex, noise, tcp, yamux, Transport,
+};
+use std::collections::hash_map::DefaultHasher;
 use std::error::Error;
+use std::hash::{Hash, Hasher};
 use std::iter;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -115,15 +121,18 @@ pub fn setup_libp2p_swarm(
 > {
     let local_keypair = keypair_util::load_or_generate_ed25519(KEYPAIR_FILENAME.as_str());
 
-    let (swarm, local_peer_id) = create_swarm(local_keypair.clone(), max_provided_keys)?;
+    let (mut swarm, local_peer_id) = create_swarm(local_keypair.clone(), max_provided_keys)?;
     let (command_sender, command_receiver) = mpsc::channel(32);
     let (event_sender, event_receiver) = mpsc::channel(32);
 
+    // EDF: Two types of implemented Topic. Example uses IdentTopic. Let's start with that.
+    // https://docs.rs/libp2p/latest/libp2p/gossipsub/type.IdentTopic.html
+    // https://docs.rs/libp2p/latest/libp2p/gossipsub/type.Sha256Topic.html
+    let pyrsia_topic = gossipsub::IdentTopic::new("pyrsia-topic");
+    swarm.behaviour_mut().gossipsub.subscribe(&pyrsia_topic)?;
+
     Ok((
-        Client {
-            sender: command_sender,
-            local_peer_id,
-        },
+        Client::new(command_sender, local_peer_id, pyrsia_topic),
         local_keypair,
         ReceiverStream::new(event_receiver),
         PyrsiaEventLoop::new(swarm, command_receiver, event_sender),
@@ -138,7 +147,7 @@ fn create_transport(
         .into_authentic(&keypair)
         .expect("Signing libp2p-noise static DH keypair failed.");
 
-    let transport = tcp::TokioTcpTransport::new(GenTcpConfig::default().nodelay(true));
+    let transport = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true));
     let dns = dns::TokioDnsConfig::system(transport)?;
 
     Ok(dns
@@ -159,16 +168,27 @@ fn create_swarm(
 ) -> Result<(Swarm<PyrsiaNetworkBehaviour>, core::PeerId), Box<dyn Error>> {
     let peer_id = keypair.public().to_peer_id();
 
-    let identify_config = identify::IdentifyConfig::new("ipfs/1.0.0".to_owned(), keypair.public());
+    let identify_config = identify::Config::new("ipfs/1.0.0".to_owned(), keypair.public());
 
     let memory_store_config = MemoryStoreConfig {
         max_provided_keys,
         ..Default::default()
     };
 
+    let gossipsub_config = gossipsub::GossipsubConfigBuilder::default()
+        .heartbeat_interval(Duration::from_secs(10)) // This is set to aid debugging by not cluttering the log space
+        .validation_mode(gossipsub::ValidationMode::Strict) // This sets the kind of message validation. The default is Strict (enforce message signing)
+        .message_id_fn(|message: &gossipsub::GossipsubMessage| {
+            // To content-address message, we can take the hash of message and use it as an ID.
+            let mut hasher = DefaultHasher::new();
+            message.data.hash(&mut hasher);
+            gossipsub::MessageId::from(hasher.finish().to_string())
+        }) // content-address messages. No two messages of the same content will be propagated.
+        .build()?;
+
     Ok((
-        SwarmBuilder::new(
-            create_transport(keypair)?,
+        SwarmBuilder::with_tokio_executor(
+            create_transport(keypair.clone())?,
             PyrsiaNetworkBehaviour {
                 auto_nat: autonat::Behaviour::new(
                     peer_id,
@@ -180,7 +200,11 @@ fn create_swarm(
                         ..Default::default()
                     },
                 ),
-                identify: identify::Identify::new(identify_config),
+                gossipsub: gossipsub::Gossipsub::new(
+                    gossipsub::MessageAuthenticity::Signed(keypair),
+                    gossipsub_config,
+                )?,
+                identify: identify::Behaviour::new(identify_config),
                 kademlia: kad::Kademlia::new(
                     peer_id,
                     MemoryStore::with_config(peer_id, memory_store_config),
@@ -205,12 +229,14 @@ fn create_swarm(
                     iter::once((BlockchainExchangeProtocol(), ProtocolSupport::Full)),
                     Default::default(),
                 ),
+                build_status_request_response: RequestResponse::new(
+                    BuildStatusExchangeCodec(),
+                    iter::once((BuildStatusExchangeProtocol(), ProtocolSupport::Full)),
+                    Default::default(),
+                ),
             },
             peer_id,
         )
-        .executor(Box::new(|fut| {
-            tokio::spawn(fut);
-        }))
         .build(),
         peer_id,
     ))

@@ -258,85 +258,37 @@ impl VerificationService {
 mod tests {
     use super::*;
     use crate::artifact_service::model::PackageType;
-    use crate::blockchain_service::service::BlockchainService;
+    use crate::blockchain_service::event::BlockchainEvent;
     use crate::build_service::event::BuildEvent;
     use crate::build_service::model::BuildResultArtifact;
-    use crate::network::client::Client;
-    use crate::transparency_log::log::{AddArtifactRequest, TransparencyLogService};
+    use crate::transparency_log::log::AddArtifactRequest;
     use crate::util::test_util;
-    use libp2p::identity::Keypair;
-    use std::path::{Path, PathBuf};
-    use std::sync::Arc;
-    use tokio::sync::{mpsc, Mutex};
-
-    fn create_p2p_client(local_keypair: &Keypair) -> Client {
-        let (command_sender, _command_receiver) = mpsc::channel(1);
-        Client {
-            sender: command_sender,
-            local_peer_id: local_keypair.public().to_peer_id(),
-        }
-    }
-
-    async fn create_blockchain_service(
-        local_keypair: &Keypair,
-        p2p_client: Client,
-        blockchain_path: impl AsRef<Path>,
-    ) -> BlockchainService {
-        let ed25519_keypair = match local_keypair {
-            libp2p::identity::Keypair::Ed25519(ref v) => v,
-            _ => {
-                panic!("Keypair Format Error");
-            }
-        };
-
-        BlockchainService::init_first_blockchain_node(
-            ed25519_keypair,
-            ed25519_keypair,
-            p2p_client,
-            blockchain_path,
-        )
-        .await
-        .expect("Creating BlockchainService failed")
-    }
-
-    async fn create_transparency_log_service(
-        artifact_path: impl AsRef<Path>,
-    ) -> TransparencyLogService {
-        let local_keypair = Keypair::generate_ed25519();
-        let p2p_client = create_p2p_client(&local_keypair);
-
-        let blockchain_service =
-            create_blockchain_service(&local_keypair, p2p_client, &artifact_path).await;
-
-        TransparencyLogService::new(&artifact_path, Arc::new(Mutex::new(blockchain_service)))
-            .unwrap()
-    }
+    use std::path::PathBuf;
 
     #[tokio::test]
     async fn test_verify_add_artifact_transaction() {
         let tmp_dir = test_util::tests::setup();
 
-        let mut transparency_log_service = create_transparency_log_service(&tmp_dir).await;
+        let (mut transparency_log_service, mut blockchain_event_receiver) =
+            test_util::tests::create_transparency_log_service(&tmp_dir);
+        let (mut verification_service, mut build_event_receiver) =
+            test_util::tests::create_verification_service();
 
         let package_type = PackageType::Docker;
         let package_specific_id = "alpine:3.15.1";
-        let transparency_log = transparency_log_service
-            .add_artifact(AddArtifactRequest {
-                package_type,
-                package_specific_id: package_specific_id.to_owned(),
-                num_artifacts: 1,
-                package_specific_artifact_id: "".to_owned(),
-                artifact_hash: uuid::Uuid::new_v4().to_string(),
-            })
-            .await
-            .unwrap();
-        let payload = serde_json::to_string(&transparency_log).unwrap();
 
-        let (verification_result_sender, _verification_result_receiver) = oneshot::channel();
-
-        let (build_event_sender, mut build_event_receiver) = mpsc::channel(1);
-
-        let build_event_client = BuildEventClient::new(build_event_sender);
+        tokio::spawn(async move {
+            loop {
+                match blockchain_event_receiver.recv().await {
+                    Some(BlockchainEvent::AddBlock { sender, .. }) => {
+                        let _ = sender.send(Ok(()));
+                    }
+                    _ => {
+                        panic!("BlockchainEvent must match BlockchainEvent::AddBlock")
+                    }
+                }
+            }
+        });
 
         tokio::spawn(async move {
             loop {
@@ -351,12 +303,27 @@ mod tests {
                         assert_eq!(sent_package_specific_id, package_specific_id);
                         let _ = sender.send(Ok(build_id));
                     }
-                    _ => panic!("BuildEvent must match BuildEvent::Verify"),
+                    _ => {
+                        panic!("BuildEvent must match BuildEvent::Verify")
+                    }
                 }
             }
         });
 
-        let mut verification_service = VerificationService::new(build_event_client).unwrap();
+        let transparency_log = transparency_log_service
+            .add_artifact(AddArtifactRequest {
+                package_type,
+                package_specific_id: package_specific_id.to_owned(),
+                num_artifacts: 1,
+                package_specific_artifact_id: "".to_owned(),
+                artifact_hash: uuid::Uuid::new_v4().to_string(),
+            })
+            .await
+            .unwrap();
+        let payload = serde_json::to_string(&transparency_log).unwrap();
+
+        let (verification_result_sender, _verification_result_receiver) = oneshot::channel();
+
         let verification_result = verification_service
             .verify_transaction(payload.as_bytes(), verification_result_sender)
             .await;
@@ -370,7 +337,36 @@ mod tests {
     async fn test_verify_add_artifact_transaction_starts_build_when_num_artifacts_reached() {
         let tmp_dir = test_util::tests::setup();
 
-        let mut transparency_log_service = create_transparency_log_service(&tmp_dir).await;
+        let (mut transparency_log_service, mut blockchain_event_receiver) =
+            test_util::tests::create_transparency_log_service(&tmp_dir);
+        let (mut verification_service, mut build_event_receiver) =
+            test_util::tests::create_verification_service();
+
+        let build_id = uuid::Uuid::new_v4();
+        tokio::spawn(async move {
+            loop {
+                match blockchain_event_receiver.recv().await {
+                    Some(BlockchainEvent::AddBlock { sender, .. }) => {
+                        let _ = sender.send(Ok(()));
+                    }
+                    _ => {
+                        panic!("BlockchainEvent must match BlockchainEvent::AddBlock")
+                    }
+                }
+            }
+        });
+        tokio::spawn(async move {
+            loop {
+                match build_event_receiver.recv().await {
+                    Some(BuildEvent::Verify { sender, .. }) => {
+                        let _ = sender.send(Ok(build_id.to_string()));
+                    }
+                    _ => {
+                        panic!("BuildEvent must match BuildEvent::Verify")
+                    }
+                }
+            }
+        });
 
         let mut payloads = vec![];
         for i in 1..=3 {
@@ -387,24 +383,6 @@ mod tests {
             let payload = serde_json::to_string(&transparency_log).unwrap();
             payloads.push(payload);
         }
-
-        let (build_event_sender, mut build_event_receiver) = mpsc::channel(1);
-
-        let build_event_client = BuildEventClient::new(build_event_sender);
-
-        let build_id = uuid::Uuid::new_v4();
-        tokio::spawn(async move {
-            loop {
-                match build_event_receiver.recv().await {
-                    Some(BuildEvent::Verify { sender, .. }) => {
-                        let _ = sender.send(Ok(build_id.to_string()));
-                    }
-                    _ => panic!("BuildEvent must match BuildEvent::Verify"),
-                }
-            }
-        });
-
-        let mut verification_service = VerificationService::new(build_event_client).unwrap();
 
         let (verification_result_sender_1, _verification_result_receiver) = oneshot::channel();
         let verification_result_1 = verification_service
@@ -437,7 +415,36 @@ mod tests {
     async fn test_handle_build_result_notifies_sender() {
         let tmp_dir = test_util::tests::setup();
 
-        let mut transparency_log_service = create_transparency_log_service(&tmp_dir).await;
+        let (mut transparency_log_service, mut blockchain_event_receiver) =
+            test_util::tests::create_transparency_log_service(&tmp_dir);
+        let (mut verification_service, mut build_event_receiver) =
+            test_util::tests::create_verification_service();
+
+        let build_id = uuid::Uuid::new_v4();
+        tokio::spawn(async move {
+            loop {
+                match blockchain_event_receiver.recv().await {
+                    Some(BlockchainEvent::AddBlock { sender, .. }) => {
+                        let _ = sender.send(Ok(()));
+                    }
+                    _ => {
+                        panic!("BlockchainEvent must match BlockchainEvent::AddBlock")
+                    }
+                }
+            }
+        });
+        tokio::spawn(async move {
+            loop {
+                match build_event_receiver.recv().await {
+                    Some(BuildEvent::Verify { sender, .. }) => {
+                        let _ = sender.send(Ok(build_id.to_string()));
+                    }
+                    _ => {
+                        panic!("BuildEvent must match BuildEvent::Verify")
+                    }
+                }
+            }
+        });
 
         let package_type = PackageType::Docker;
         let package_specific_id = "alpine:3.15.1";
@@ -457,23 +464,6 @@ mod tests {
 
         let (verification_result_sender, verification_result_receiver) = oneshot::channel();
 
-        let (build_event_sender, mut build_event_receiver) = mpsc::channel(1);
-
-        let build_event_client = BuildEventClient::new(build_event_sender);
-
-        let build_id = uuid::Uuid::new_v4();
-        tokio::spawn(async move {
-            loop {
-                match build_event_receiver.recv().await {
-                    Some(BuildEvent::Verify { sender, .. }) => {
-                        let _ = sender.send(Ok(build_id.to_string()));
-                    }
-                    _ => panic!("BuildEvent must match BuildEvent::Verify"),
-                }
-            }
-        });
-
-        let mut verification_service = VerificationService::new(build_event_client).unwrap();
         let verification_result = verification_service
             .verify_transaction(payload.as_bytes(), verification_result_sender)
             .await;
@@ -504,7 +494,36 @@ mod tests {
     async fn test_handle_build_result_with_missing_artifact_notifies_sender() {
         let tmp_dir = test_util::tests::setup();
 
-        let mut transparency_log_service = create_transparency_log_service(&tmp_dir).await;
+        let (mut transparency_log_service, mut blockchain_event_receiver) =
+            test_util::tests::create_transparency_log_service(&tmp_dir);
+        let (mut verification_service, mut build_event_receiver) =
+            test_util::tests::create_verification_service();
+
+        let build_id = uuid::Uuid::new_v4();
+        tokio::spawn(async move {
+            loop {
+                match blockchain_event_receiver.recv().await {
+                    Some(BlockchainEvent::AddBlock { sender, .. }) => {
+                        let _ = sender.send(Ok(()));
+                    }
+                    _ => {
+                        panic!("BlockchainEvent must match BlockchainEvent::AddBlock")
+                    }
+                }
+            }
+        });
+        tokio::spawn(async move {
+            loop {
+                match build_event_receiver.recv().await {
+                    Some(BuildEvent::Verify { sender, .. }) => {
+                        let _ = sender.send(Ok(build_id.to_string()));
+                    }
+                    _ => {
+                        panic!("BuildEvent must match BuildEvent::Verify")
+                    }
+                }
+            }
+        });
 
         let package_type = PackageType::Docker;
         let package_specific_id = "alpine:3.15.1";
@@ -524,23 +543,6 @@ mod tests {
 
         let (verification_result_sender, verification_result_receiver) = oneshot::channel();
 
-        let (build_event_sender, mut build_event_receiver) = mpsc::channel(1);
-
-        let build_event_client = BuildEventClient::new(build_event_sender);
-
-        let build_id = uuid::Uuid::new_v4();
-        tokio::spawn(async move {
-            loop {
-                match build_event_receiver.recv().await {
-                    Some(BuildEvent::Verify { sender, .. }) => {
-                        let _ = sender.send(Ok(build_id.to_string()));
-                    }
-                    _ => panic!("BuildEvent must match BuildEvent::Verify"),
-                }
-            }
-        });
-
-        let mut verification_service = VerificationService::new(build_event_client).unwrap();
         let verification_result = verification_service
             .verify_transaction(payload.as_bytes(), verification_result_sender)
             .await;
@@ -579,7 +581,36 @@ mod tests {
     async fn test_handle_build_result_with_different_hash_notifies_sender() {
         let tmp_dir = test_util::tests::setup();
 
-        let mut transparency_log_service = create_transparency_log_service(&tmp_dir).await;
+        let (mut transparency_log_service, mut blockchain_event_receiver) =
+            test_util::tests::create_transparency_log_service(&tmp_dir);
+        let (mut verification_service, mut build_event_receiver) =
+            test_util::tests::create_verification_service();
+
+        let build_id = uuid::Uuid::new_v4();
+        tokio::spawn(async move {
+            loop {
+                match blockchain_event_receiver.recv().await {
+                    Some(BlockchainEvent::AddBlock { sender, .. }) => {
+                        let _ = sender.send(Ok(()));
+                    }
+                    _ => {
+                        panic!("BlockchainEvent must match BlockchainEvent::AddBlock")
+                    }
+                }
+            }
+        });
+        tokio::spawn(async move {
+            loop {
+                match build_event_receiver.recv().await {
+                    Some(BuildEvent::Verify { sender, .. }) => {
+                        let _ = sender.send(Ok(build_id.to_string()));
+                    }
+                    _ => {
+                        panic!("BuildEvent must match BuildEvent::Verify")
+                    }
+                }
+            }
+        });
 
         let package_type = PackageType::Docker;
         let package_specific_id = "alpine:3.15.1";
@@ -599,23 +630,6 @@ mod tests {
 
         let (verification_result_sender, verification_result_receiver) = oneshot::channel();
 
-        let (build_event_sender, mut build_event_receiver) = mpsc::channel(1);
-
-        let build_event_client = BuildEventClient::new(build_event_sender);
-
-        let build_id = uuid::Uuid::new_v4();
-        tokio::spawn(async move {
-            loop {
-                match build_event_receiver.recv().await {
-                    Some(BuildEvent::Verify { sender, .. }) => {
-                        let _ = sender.send(Ok(build_id.to_string()));
-                    }
-                    _ => panic!("BuildEvent must match BuildEvent::Verify"),
-                }
-            }
-        });
-
-        let mut verification_service = VerificationService::new(build_event_client).unwrap();
         let verification_result = verification_service
             .verify_transaction(payload.as_bytes(), verification_result_sender)
             .await;
@@ -656,7 +670,36 @@ mod tests {
     async fn test_handle_failed_build_notifies_sender() {
         let tmp_dir = test_util::tests::setup();
 
-        let mut transparency_log_service = create_transparency_log_service(&tmp_dir).await;
+        let (mut transparency_log_service, mut blockchain_event_receiver) =
+            test_util::tests::create_transparency_log_service(&tmp_dir);
+        let (mut verification_service, mut build_event_receiver) =
+            test_util::tests::create_verification_service();
+
+        let build_id = uuid::Uuid::new_v4();
+        tokio::spawn(async move {
+            loop {
+                match blockchain_event_receiver.recv().await {
+                    Some(BlockchainEvent::AddBlock { sender, .. }) => {
+                        let _ = sender.send(Ok(()));
+                    }
+                    _ => {
+                        panic!("BlockchainEvent must match BlockchainEvent::AddBlock")
+                    }
+                }
+            }
+        });
+        tokio::spawn(async move {
+            loop {
+                match build_event_receiver.recv().await {
+                    Some(BuildEvent::Verify { sender, .. }) => {
+                        let _ = sender.send(Ok(build_id.to_string()));
+                    }
+                    _ => {
+                        panic!("BuildEvent must match BuildEvent::Verify")
+                    }
+                }
+            }
+        });
 
         let package_type = PackageType::Docker;
         let package_specific_id = "alpine:3.15.1";
@@ -674,23 +717,6 @@ mod tests {
 
         let (verification_result_sender, verification_result_receiver) = oneshot::channel();
 
-        let (build_event_sender, mut build_event_receiver) = mpsc::channel(1);
-
-        let build_event_client = BuildEventClient::new(build_event_sender);
-
-        let build_id = uuid::Uuid::new_v4();
-        tokio::spawn(async move {
-            loop {
-                match build_event_receiver.recv().await {
-                    Some(BuildEvent::Verify { sender, .. }) => {
-                        let _ = sender.send(Ok(build_id.to_string()));
-                    }
-                    _ => panic!("BuildEvent must match BuildEvent::Verify"),
-                }
-            }
-        });
-
-        let mut verification_service = VerificationService::new(build_event_client).unwrap();
         let verify_transaction_result = verification_service
             .verify_transaction(payload.as_bytes(), verification_result_sender)
             .await;
